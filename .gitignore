@@ -5,6 +5,9 @@ _to_delete/
 *.log
 # Build outputs (local only; reproduce via documented toolchains on E:)
 agents/esp32-ob/idf/build/
+agents/esp32-ob/idf/sdkconfig
+agents/esp32-ob/idf/sdkconfig.old
+agents/esp32-ob/idf/dependencies.lock
 agents/esp32-ob/ob_esp32/build/
 agents/playdate-ob/game/build-arm/
 agents/playdate-ob/game/build-sim/
