@@ -50,6 +50,7 @@
 
 #include "protocol.h"
 #include "orb_hud.h"
+#include <termios.h>
 
 /* =========================================================================
  * PLATFORM COMPAT SHIMS
@@ -104,6 +105,7 @@ static pid_t g_upgraded_from_pid = 0;
 static uint64_t g_rpc_calls_total = 0;
 static volatile int g_link_connected = 0;   /* orb HUD: 1 while a master socket is open */
 static orb_t g_orb;                         /* orb HUD presence model */
+static void hud_flow_push(int dir, const char *label, uint64_t bytes);   /* live flows (HUD) */
 
 static pthread_mutex_t g_log_lock      = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_telemetry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2641,6 +2643,7 @@ static bool send_bin_ack(int s, uint32_t file_id, uint32_t status, uint64_t offs
     pthread_mutex_lock(&g_send_lock);
     bool ok = send_all(s, (const char *)&tag, sizeof(tag)) && send_all(s, (const char *)&ack, sizeof(ack));
     pthread_mutex_unlock(&g_send_lock);
+    if (ok) hud_flow_push(1, "chunk.ack", (uint64_t)(sizeof(tag) + sizeof(ack)));
     if (ok) { pthread_mutex_lock(&g_telemetry_lock); g_bytes_tx += sizeof(tag)+sizeof(ack); g_packets_tx++; pthread_mutex_unlock(&g_telemetry_lock); }
     return ok;
 }
@@ -2665,6 +2668,7 @@ static bool handle_bin_chunk(int s, const uint8_t *prefix) {
 
     pthread_mutex_lock(&g_telemetry_lock);
     g_bytes_rx += sizeof(BridgeBinaryChunkHeader) + hdr.length;
+    hud_flow_push(0, "file.chunk", (uint64_t)hdr.length);
     g_packets_rx++;
     pthread_mutex_unlock(&g_telemetry_lock);
 
@@ -2796,6 +2800,7 @@ static void dispatch_rpc(const char *req, int sock) {
     uint64_t t0 = get_tick_ms();
 
     console_log_packet_rx(id, method, "");
+    hud_flow_push(0, method ? method : "?", (uint64_t)strlen(req));
 
     bool trigger_exit = false;
 
@@ -2881,6 +2886,7 @@ static void dispatch_rpc(const char *req, int sock) {
     uint64_t elapsed = get_tick_ms() - t0;
     int err_code = (strstr(resp.data, "\"error\"") != NULL) ? -1 : 0;
     console_log_packet_tx(id, method, err_code, elapsed, resp.len);
+    hud_flow_push(1, method ? method : "?", (uint64_t)resp.len);
     free(method);
 
     send_envelope(sock, resp.data);
@@ -2915,9 +2921,11 @@ static bool do_handshake(int sock) {
              "\"os\":\"" AGENT_OS "\",\"pid\":%lu,\"agent_id\":\"%s\",\"agent_nonce\":\"%s\"}}",
              (unsigned long)getpid(), g_agent_id, agent_nonce);
     if (!send_frame(sock, hello)) return false;
+    hud_flow_push(1, "agent.hello", strlen(hello));
 
     char *ch = recv_frame(sock);
     if (!ch) return false;
+    hud_flow_push(0, "auth.challenge", strlen(ch));
     char *ch_method = json_get_string(ch, "method");
     const char *params = json_find_key(ch, "params");
     char *master_nonce = params ? json_get_string(params, "master_nonce") : NULL;
@@ -2937,10 +2945,12 @@ static bool do_handshake(int sock) {
                  "{\"jsonrpc\":\"2.0\",\"method\":\"auth.response\",\"params\":{"
                  "\"agent_id\":\"%s\",\"hmac\":\"%s\"}}", g_agent_id, rh);
         ok = send_frame(sock, aresp);
+        if (ok) hud_flow_push(1, "auth.response", strlen(aresp));
     }
     if (!ok) { free(master_nonce); free(echo_id); free(ch); return false; }
 
     char *cf = recv_frame(sock);
+    if (cf) hud_flow_push(0, "auth.confirm", strlen(cf));
     free(echo_id);
     free(ch);
     if (!cf) { free(master_nonce); return false; }
@@ -3115,76 +3125,272 @@ static void signal_handler(int sig) {
  * ========================================================================= */
 
 /* =========================================================================
- * ORB HUD: the shared voice orb (orb_core.h/orb_hud.h) rendered into the
- * terminal, with a compact live panel beside it. Only on a real TTY.
+ * LIVE HUD (TTY only): the shared voice orb + live data flows in a band at
+ * the top of the terminal, logs scroll underneath. Outgoing messages leave
+ * the sphere as amber comets towards the edges, incoming ones fly in as
+ * emerald comets, each with a short label. Keys: F view flows, R reconnect.
  * ========================================================================= */
-#define ORB_HUD_COLS  26
 #define ORB_HUD_ROWS  12
-#define ORB_HUD_TOP    2
-#define ORB_HUD_LEFT   2
+#define ORB_HUD_TOP    1
 #define ORB_LOG_TOP   (ORB_HUD_TOP + ORB_HUD_ROWS + 1)   /* first log line */
+#define HUD_FLOW_OUT  1
+#define HUD_FLOW_IN   0
 
-static uint64_t g_orb_prev_traf = 0, g_orb_prev_rpc = 0;
-static int g_orb_rpc_hold = 0;
+typedef struct { uint64_t seq; int dir; uint64_t bytes; char label[40]; } HudFlow;
+#define HUD_FLOW_CAP 128
+static HudFlow g_hud_flows[HUD_FLOW_CAP];
+static uint64_t g_hud_flow_seq = 0;
+static pthread_mutex_t g_hud_flow_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_session_fd = -1;
+static volatile int g_hud_show_flows = 1;
+static struct termios g_hud_tio_saved;
+static volatile int g_hud_tio_raw = 0;
 
-static void orb_hud_tty(void) {
+static void hud_flow_push(int dir, const char *label, uint64_t bytes) {
+    pthread_mutex_lock(&g_hud_flow_lock);
+    uint64_t sq = ++g_hud_flow_seq;
+    HudFlow *f = &g_hud_flows[sq % HUD_FLOW_CAP];
+    f->seq = sq; f->dir = dir; f->bytes = bytes;
+    snprintf(f->label, sizeof(f->label), "%s", label ? label : "?");
+    pthread_mutex_unlock(&g_hud_flow_lock);
+}
+
+typedef struct { int alive, dir, labeled; float t, life, size, ax, ay, bx, by, cx, cy; float tr[10][2]; int tn; char label[48]; } HudComet;
+#define HUD_PMAX 40
+static HudComet g_hcom[HUD_PMAX];
+static hud_canvas_t g_hud;
+static uint64_t g_hud_seen = 0, g_hud_msgs[2], g_hud_rate_acc[2];
+static double g_hud_rate[2];
+static float g_hud_act[2];
+static uint64_t g_orb_prev_rpc = 0;
+static char g_hud_toast[64]; static uint64_t g_hud_toast_until = 0;
+
+static float hud_frand(void) { return (float)rand() / (float)RAND_MAX; }
+static void hud_fmt_bytes(uint64_t n, char *o, size_t c) {
+    if (n < 1024) { snprintf(o, c, "%lluB", (unsigned long long)n); return; }
+    double v = n / 1024.0; const char *u = "KB";
+    if (v >= 1024) { v /= 1024; u = "MB"; }
+    snprintf(o, c, v < 10 ? "%.1f%s" : "%.0f%s", v, u);
+}
+
+static void hud_spawn(int dir, const char *label, uint64_t bytes, int W, int H, float ocx, float ocy, float R, int *budget) {
+    g_hud_msgs[dir]++; g_hud_rate_acc[dir] += bytes;
+    g_hud_act[dir] = fminf(1.f, g_hud_act[dir] + 0.35f);
+    orb_bump(&g_orb, dir == HUD_FLOW_OUT ? 0.30f : 0.20f);
+    if (!g_hud_show_flows || *budget <= 0) return;
+    (*budget)--;
+    HudComet *c = NULL; int labeled = 0;
+    for (int i = 0; i < HUD_PMAX; i++) { if (g_hcom[i].alive && g_hcom[i].labeled) labeled++; if (!c && !g_hcom[i].alive) c = &g_hcom[i]; }
+    if (!c) return;
+    memset(c, 0, sizeof(*c));
+    c->alive = 1; c->dir = dir;
+    float ang = hud_frand() * 6.2831853f, ux = cosf(ang), uy = sinf(ang);
+    /* distance to leave the band in that direction, plus a margin */
+    float tx = ux > 0 ? (W + 3 - ocx) / ux : ux < 0 ? (-3 - ocx) / ux : 1e9f;
+    float ty = uy > 0 ? (H + 3 - ocy) / uy : uy < 0 ? (-3 - ocy) / uy : 1e9f;
+    float reach = fminf(tx, ty);
+    float sx = ocx + ux * R, sy = ocy + uy * R, ox = ocx + ux * reach, oy = ocy + uy * reach;
+    if (dir == HUD_FLOW_OUT) { c->ax = sx; c->ay = sy; c->bx = ox; c->by = oy; } else { c->ax = ox; c->ay = oy; c->bx = sx; c->by = sy; }
+    float dx = c->bx - c->ax, dy = c->by - c->ay, L = sqrtf(dx * dx + dy * dy) + 1e-3f;
+    float bend = (0.08f + 0.12f * hud_frand()) * L * (dir == HUD_FLOW_OUT ? 1.f : -1.f);
+    c->cx = (c->ax + c->bx) * 0.5f - dy / L * bend; c->cy = (c->ay + c->by) * 0.5f + dx / L * bend;
+    c->life = fminf(2.6f, fmaxf(0.9f, L / 55.f)) + hud_frand() * 0.3f;
+    c->labeled = labeled < 5 && hud_frand() < 0.85f;
+    c->size = c->labeled ? 0.9f : 0.6f;
+    if (c->labeled) {
+        char sz[16] = ""; if (bytes) hud_fmt_bytes(bytes, sz, sizeof(sz));
+        snprintf(c->label, sizeof(c->label), "%s %.20s%s%s", dir == HUD_FLOW_OUT ? "\xE2\x86\x91" : "\xE2\x86\x93",
+                 label ? label : "?", sz[0] ? " " : "", sz);
+    }
+}
+
+static void hud_comets_step_draw(orb_surface *s, float dt) {
+    for (int i = 0; i < HUD_PMAX; i++) {
+        HudComet *c = &g_hcom[i];
+        if (!c->alive) continue;
+        c->t += dt / c->life;
+        if (c->t >= 1.f) { if (c->dir == HUD_FLOW_IN) orb_bump(&g_orb, 0.45f); c->alive = 0; continue; }
+        float u = c->dir == HUD_FLOW_OUT ? powf(c->t, 1.5f) : 1.f - powf(1.f - c->t, 1.6f);
+        float a = (1 - u) * (1 - u), b = 2 * (1 - u) * u, d = u * u;
+        float x = a * c->ax + b * c->cx + d * c->bx, y = a * c->ay + b * c->cy + d * c->by;
+        int n = c->tn < 10 ? c->tn + 1 : 10;
+        for (int k = n - 1; k > 0; k--) { c->tr[k][0] = c->tr[k - 1][0]; c->tr[k][1] = c->tr[k - 1][1]; }
+        c->tr[0][0] = x; c->tr[0][1] = y; c->tn = n;
+        float col[3], hot[3];
+        if (c->dir == HUD_FLOW_OUT) { col[0] = 255; col[1] = 176; col[2] = 64; } else { col[0] = 52; col[1] = 255; col[2] = 170; }
+        for (int k = 0; k < 3; k++) hot[k] = col[k] + (255.f - col[k]) * 0.6f;
+        float fade = fminf(1.f, c->t / 0.08f) * fminf(1.f, (1.f - c->t) / 0.12f);
+        for (int k = c->tn - 1; k >= 1; k--) {
+            float x0 = c->tr[k][0], y0 = c->tr[k][1], x1 = c->tr[k - 1][0], y1 = c->tr[k - 1][1];
+            int steps = (int)(sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) / 0.8f) + 1;
+            if (steps > 30) steps = 30;
+            for (int j = 0; j < steps; j++) {
+                float uu = (float)j / steps, f = 1.f - ((float)k - uu) / 10.f;
+                orb__splat(s, x0 + (x1 - x0) * uu, y0 + (y1 - y0) * uu, 0.5f, col, 0.30f * f * f * fade);
+            }
+        }
+        orb__splat(s, x, y, 1.6f, col, 0.30f * fade);
+        orb__splat(s, x, y, c->size, hot, 0.95f * fade);
+    }
+}
+
+static void hud_labels(float ocx, float ocy, float R) {
+    for (int i = 0; i < HUD_PMAX; i++) {
+        HudComet *c = &g_hcom[i];
+        if (!c->alive || !c->labeled || c->tn < 2) continue;
+        float x = c->tr[0][0], y = c->tr[0][1];
+        if ((x - ocx) * (x - ocx) + (y - ocy) * (y - ocy) < (R * 1.9f) * (R * 1.9f)) continue;
+        float vis = c->dir == HUD_FLOW_IN ? fminf(1.f, (1.f - c->t) / 0.35f) : fminf(1.f, (1.f - c->t) / 0.4f);
+        if (vis < 0.35f) continue;
+        int row = (int)(y / 2.f), col = (int)x + 2, len = hud_strcells(c->label);
+        if (!hud_free(&g_hud, row, col - 1, len + 3)) col = (int)x - len - 2;     /* keep a blank cell on both sides */
+        if (!hud_free(&g_hud, row, col - 1, len + 3)) continue;
+        hud_text(&g_hud, row, col, c->label, c->dir == HUD_FLOW_OUT ? 0xFFC46Bu : 0x5CFFC0u, 0x0A0D1Au, 0);
+    }
+}
+
+static void hud_render_tty(float dt) {
     if (!g_vt_enabled) return;
-    static char frame[200000];
-    int connected = __atomic_load_n(&g_link_connected, __ATOMIC_RELAXED);
-    int live = connected && g_have_sess;
+    static char out[400000];
+    static uint64_t last_full = 0;
+    struct winsize ws; int cols = 100;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20) cols = ws.ws_col;
+    if (cols > HUD_MAX_COLS) cols = HUD_MAX_COLS;
+    int connected = __atomic_load_n(&g_link_connected, __ATOMIC_RELAXED), live = connected && g_have_sess;
 
-    /* drive mood from traffic + rpc deltas */
-    uint64_t traf = g_packets_rx + g_packets_tx;
-    if (g_orb_prev_rpc && g_rpc_calls_total > g_orb_prev_rpc) { orb_pulse(&g_orb); g_orb_rpc_hold = 12; }
+    hud_begin(&g_hud, cols, ORB_HUD_ROWS);
+    int W = cols, H = ORB_HUD_ROWS * 2;
+    float ocx = 15.f, ocy = H * 0.5f, R = 7.6f;
+
+    /* drain flows -> comets */
+    int budget = 4;
+    HudFlow batch[HUD_FLOW_CAP]; int nb = 0;
+    pthread_mutex_lock(&g_hud_flow_lock);
+    uint64_t first = g_hud_seen + 1;
+    if (g_hud_flow_seq >= HUD_FLOW_CAP && first < g_hud_flow_seq - HUD_FLOW_CAP + 1) first = g_hud_flow_seq - HUD_FLOW_CAP + 1;
+    for (uint64_t q = first; q <= g_hud_flow_seq; q++) { HudFlow *f = &g_hud_flows[q % HUD_FLOW_CAP]; if (f->seq == q) batch[nb++] = *f; }
+    g_hud_seen = g_hud_flow_seq;
+    pthread_mutex_unlock(&g_hud_flow_lock);
+    for (int i = 0; i < nb; i++) hud_spawn(batch[i].dir, batch[i].label, batch[i].bytes, W, H, ocx, ocy, R, &budget);
+
+    static uint64_t rate_t = 0; uint64_t now = get_tick_ms();
+    if (!rate_t) rate_t = now;
+    if (now - rate_t >= 500) {
+        double k = 1000.0 / (double)(now - rate_t);
+        for (int d = 0; d < 2; d++) { g_hud_rate[d] = g_hud_rate[d] * 0.4 + g_hud_rate_acc[d] * k * 0.6; g_hud_rate_acc[d] = 0; }
+        rate_t = now;
+    }
+    for (int d = 0; d < 2; d++) g_hud_act[d] *= powf(0.25f, dt);
+    if (g_orb_prev_rpc && g_rpc_calls_total > g_orb_prev_rpc) orb_bump(&g_orb, 0.4f);
     g_orb_prev_rpc = g_rpc_calls_total;
-    float lvl = 0.f;
-    if (g_orb_prev_traf && traf > g_orb_prev_traf) lvl = 0.8f;
-    g_orb_prev_traf = traf;
 
-    int st = !connected ? ORB_OFFLINE : !live ? ORB_THINK : ORB_IDLE;
-    if (live && g_orb_rpc_hold > 0) { g_orb_rpc_hold--; st = ORB_SPEAK; }
-    else if (live && lvl > 0.f) st = ORB_LISTEN;
-    orb_set_state(&g_orb, st);
-    if (lvl > 0.f) orb_level(&g_orb, lvl);
-    orb_step(&g_orb, 0.045f);
+    int out_b = g_hud_act[HUD_FLOW_OUT] > 0.2f, in_b = g_hud_act[HUD_FLOW_IN] > 0.2f;
+    int mood = !connected ? ORB_OFFLINE : !live ? ORB_THINK : out_b ? ORB_SPEAK : in_b ? ORB_LISTEN : ORB_IDLE;
+    const char *word = !connected ? "OFFLINE" : !live ? "CONNECTING" : (out_b && in_b) ? "EXCHANGING" : out_b ? "SENDING" : in_b ? "RECEIVING" : "LINKED";
+    uint32_t wcol = !connected ? 0x8A94B6u : !live ? 0xB388FFu : out_b ? 0xFFB040u : in_b ? 0x34FFAAu : 0x00E5FFu;
+    if (g_orb.state != mood && (mood == ORB_OFFLINE || mood == ORB_THINK || g_orb.state == ORB_OFFLINE || g_orb.state == ORB_THINK)) orb_set_state(&g_orb, mood);
+    else g_orb.state = mood;
+    float lvl = fmaxf(g_hud_act[0], g_hud_act[1]);
+    if (lvl > 0.02f) orb_level(&g_orb, lvl * 0.85f);
+    orb_step(&g_orb, dt);
 
-    const char *word = !connected ? "OFFLINE" : !live ? "LINKING" : "LINKED";
-    const char *wclr = !connected ? CLR_DIM : !live ? CLR_MAGENTA : CLR_CYAN;
+    orb_surface s = hud_surface(&g_hud);
+    orb_render(&g_orb, &s, ocx, ocy, R, 1.0f);
+    hud_comets_step_draw(&s, dt);
 
-    uint64_t up = (get_tick_ms() - g_ui_start_tick) / 1000ULL;
-    char upb[24];
-    if (up < 5400) snprintf(upb, sizeof(upb), "%llum%02llus", (unsigned long long)(up/60), (unsigned long long)(up%60));
-    else snprintf(upb, sizeof(upb), "%lluh%02llum", (unsigned long long)(up/3600), (unsigned long long)((up/60)%60));
+    /* text panel */
+    int px = 32;
+    char line[200], up[24], rx[16], tx[16], ro[16], ri[16];
+    uint64_t upt = (now - g_ui_start_tick) / 1000ULL;
+    if (upt < 5400) snprintf(up, sizeof(up), "%llum%02llus", (unsigned long long)(upt / 60), (unsigned long long)(upt % 60));
+    else snprintf(up, sizeof(up), "%lluh%02llum", (unsigned long long)(upt / 3600), (unsigned long long)((upt / 60) % 60));
+    hud_text(&g_hud, 1, px, "BRIDGE AGENT", 0x00E5FFu, 0, 1);
+    snprintf(line, sizeof(line), "v%s \xC2\xB7 %s \xC2\xB7 Linux", BRIDGE_PROTOCOL_VERSION, AGENT_ARCH);
+    hud_text(&g_hud, 1, px + 14, line, 0x8A94B6u, 0, 0);
+    snprintf(line, sizeof(line), "\xE2\x97\x8F %s", word);
+    hud_text(&g_hud, 2, px, line, wcol, 0, 1);
+    snprintf(line, sizeof(line), "%s:%u", g_master_host, (unsigned)g_master_port);
+    hud_text(&g_hud, 2, px + hud_strcells(word) + 4, line, 0x8A94B6u, 0, 0);
+    snprintf(line, sizeof(line), "agent  %s", g_agent_id);                     hud_text(&g_hud, 4, px, line, 0xECF0FFu, 0, 0);
+    snprintf(line, sizeof(line), "uptime %s   rpc %llu", up, (unsigned long long)g_rpc_calls_total);
+    hud_text(&g_hud, 5, px, line, 0xECF0FFu, 0, 0);
+    hud_fmt_bytes(g_bytes_rx, rx, sizeof(rx)); hud_fmt_bytes(g_bytes_tx, tx, sizeof(tx));
+    snprintf(line, sizeof(line), "net    \xE2\x86\x93 %s  \xE2\x86\x91 %s   cpu %.0f%%  ram %lluMB", rx, tx, g_cpu_load_pct,
+             (unsigned long long)(g_ram_avail_bytes / (1024 * 1024)));
+    hud_text(&g_hud, 6, px, line, 0xECF0FFu, 0, 0);
+    hud_fmt_bytes((uint64_t)g_hud_rate[HUD_FLOW_OUT], ro, sizeof(ro)); hud_fmt_bytes((uint64_t)g_hud_rate[HUD_FLOW_IN], ri, sizeof(ri));
+    snprintf(line, sizeof(line), " \xE2\x86\x91 OUT %llu msgs \xC2\xB7 %s/s ", (unsigned long long)g_hud_msgs[HUD_FLOW_OUT], ro);
+    hud_text(&g_hud, 8, px, line, 0xFFB040u, 0x2A1C08u, 1);
+    int ow = hud_strcells(line) + 1;
+    snprintf(line, sizeof(line), " \xE2\x86\x93 IN %llu msgs \xC2\xB7 %s/s ", (unsigned long long)g_hud_msgs[HUD_FLOW_IN], ri);
+    hud_text(&g_hud, 8, px + ow, line, 0x34FFAAu, 0x06261Au, 1);
+    /* key caps */
+    hud_text(&g_hud, 10, px, " F ", 0x05070Fu, g_hud_show_flows ? 0xFFB040u : 0x8A94B6u, 1);
+    hud_text(&g_hud, 10, px + 4, g_hud_show_flows ? "View flows: on " : "View flows: off", g_hud_show_flows ? 0xFFC46Bu : 0x8A94B6u, 0, 0);
+    hud_text(&g_hud, 10, px + 21, " R ", 0x05070Fu, 0x00E5FFu, 1);
+    hud_text(&g_hud, 10, px + 25, "Reconnect", 0x9BE9FFu, 0, 0);
+    hud_text(&g_hud, 10, px + 36, " Ctrl+C ", 0x05070Fu, 0xFF8A8Au, 1);
+    hud_text(&g_hud, 10, px + 45, "Quit", 0xFFB3B3u, 0, 0);
+    if (now < g_hud_toast_until) hud_text(&g_hud, 11, px, g_hud_toast, 0xECF0FFu, 0, 0);
+    hud_labels(ocx, ocy, R);
 
-    size_t n = orb_hud_frame(&g_orb, frame, sizeof(frame), ORB_HUD_COLS, ORB_HUD_ROWS, ORB_HUD_TOP, ORB_HUD_LEFT);
-    int px = ORB_HUD_LEFT + ORB_HUD_COLS + 3;   /* stats column */
-    int py = ORB_HUD_TOP + 1;
-    #define ORB_LINE(row,fmt,...) n += (size_t)snprintf(frame+n, sizeof(frame)-n, "\033[%d;%dH\033[K" fmt CLR_RESET, (row), px, ##__VA_ARGS__)
-    ORB_LINE(py+0, CLR_BOLD CLR_CYAN "BRIDGE AGENT" CLR_RESET "  " CLR_DIM "v" BRIDGE_PROTOCOL_VERSION " %s", AGENT_ARCH);
-    ORB_LINE(py+1, "%s%-9s" CLR_RESET CLR_DIM " %s:%u", wclr, word, g_master_host, (unsigned int)g_master_port);
-    ORB_LINE(py+3, CLR_DIM "agent " CLR_RESET CLR_WHITE "%s", g_agent_id);
-    ORB_LINE(py+4, CLR_DIM "uptime " CLR_RESET "%s", upb);
-    ORB_LINE(py+5, CLR_DIM "rpc    " CLR_RESET CLR_YELLOW "%llu", (unsigned long long)g_rpc_calls_total);
-    ORB_LINE(py+6, CLR_DIM "net    " CLR_RESET CLR_CYAN "%llu" CLR_DIM " rx " CLR_RESET CLR_GREEN "%llu" CLR_DIM " tx",
-             (unsigned long long)g_packets_rx, (unsigned long long)g_packets_tx);
-    ORB_LINE(py+7, CLR_DIM "cpu    " CLR_RESET "%.0f%%  " CLR_DIM "ram " CLR_RESET "%lluMB",
-             g_cpu_load_pct, (unsigned long long)(g_ram_avail_bytes/(1024*1024)));
-    #undef ORB_LINE
-
+    int force = (now - last_full) > 5000;          /* repaint everything now and then (Ctrl+L, resizes) */
+    if (force) last_full = now;
+    size_t n = hud_flush(&g_hud, out, sizeof(out), ORB_HUD_TOP, 1, force);
+    if (!n) return;
     pthread_mutex_lock(&g_console_lock);
-    printf("\0337");                 /* save cursor (DECSC) */
-    fwrite(frame, 1, n, stdout);
-    printf("\0338");                 /* restore cursor (DECRC) -> back inside the log scroll region */
+    fputs("\0337", stdout);                        /* save cursor (DECSC) */
+    fwrite(out, 1, n, stdout);
+    fputs("\0338", stdout);                        /* restore -> back inside the log scroll region */
     fflush(stdout);
     pthread_mutex_unlock(&g_console_lock);
 }
 
+static void hud_toast(const char *msg) { snprintf(g_hud_toast, sizeof(g_hud_toast), "%s", msg); g_hud_toast_until = get_tick_ms() + 2500; }
+
+static void hud_tty_restore(void) {
+    if (g_hud_tio_raw) { tcsetattr(STDIN_FILENO, TCSANOW, &g_hud_tio_saved); g_hud_tio_raw = 0; }
+}
+
+/* keys: F toggles the flow view, R drops the session (the reconnect loop dials again) */
+static void *HudKeysThread(void *arg) {
+    (void)arg;
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &g_hud_tio_saved) != 0) return NULL;
+    struct termios raw = g_hud_tio_saved;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);      /* ISIG kept: Ctrl+C still stops the agent */
+    raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 2;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return NULL;
+    g_hud_tio_raw = 1;
+    atexit(hud_tty_restore);
+    while (__atomic_load_n(&g_running, __ATOMIC_RELAXED)) {
+        char ch;
+        if (read(STDIN_FILENO, &ch, 1) != 1) continue;
+        if (ch == 'f' || ch == 'F') {
+            g_hud_show_flows = !g_hud_show_flows;
+            if (!g_hud_show_flows) for (int i = 0; i < HUD_PMAX; i++) g_hcom[i].alive = 0;
+            hud_toast(g_hud_show_flows ? "Flows visible" : "Flows hidden");
+        } else if (ch == 'r' || ch == 'R') {
+            int fd = __atomic_load_n(&g_session_fd, __ATOMIC_RELAXED);
+            if (fd >= 0) { shutdown(fd, SHUT_RDWR); hud_toast("Reconnecting..."); agent_log(LOG_LVL_INFO, "Reconnect requested from the HUD."); }
+            else hud_toast("Not connected");
+        }
+    }
+    hud_tty_restore();
+    return NULL;
+}
+
 static void *OrbThread(void *arg) {
     (void)arg;
+    srand((unsigned)get_tick_ms());
     orb_init(&g_orb);
+    g_orb.particle_gain = 0.20f; g_orb.glow_gain = 0.55f;   /* ~800 particles in a 15-px sphere: keep it from saturating */
+    uint64_t last = get_tick_ms();
     while (__atomic_load_n(&g_running, __ATOMIC_RELAXED)) {
-        orb_hud_tty();
-        sleep_ms(45);
+        uint64_t now = get_tick_ms();
+        float dt = (now - last) / 1000.f; last = now;
+        if (dt > 0.1f) dt = 0.1f;
+        hud_render_tty(dt);
+        sleep_ms(80);
     }
     return NULL;
 }
@@ -3314,8 +3520,9 @@ int main(int argc, char *argv[]) {
     pthread_detach(telemetry_thread);
 
     if (g_vt_enabled) {
-        pthread_t orb_thread;
+        pthread_t orb_thread, keys_thread;
         if (pthread_create(&orb_thread, NULL, OrbThread, NULL) == 0) pthread_detach(orb_thread);
+        if (pthread_create(&keys_thread, NULL, HudKeysThread, NULL) == 0) pthread_detach(keys_thread);
     }
 
     agent_log(LOG_LVL_INFO, CLR_CYAN "BridgeLinux Agent v" BRIDGE_PROTOCOL_VERSION CLR_RESET
@@ -3336,7 +3543,9 @@ int main(int argc, char *argv[]) {
         }
         backoff_ms = 1000;
         __atomic_store_n(&g_link_connected, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_session_fd, sock, __ATOMIC_RELAXED);
         connection_loop(sock);
+        __atomic_store_n(&g_session_fd, -1, __ATOMIC_RELAXED);
         __atomic_store_n(&g_link_connected, 0, __ATOMIC_RELAXED);
         close(sock);
         if (__atomic_load_n(&g_running, __ATOMIC_RELAXED))
@@ -3345,7 +3554,8 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     cleanup_gpu_telemetry();
-    if (g_vt_enabled) { printf("\033[r\033[?25h\n"); fflush(stdout); }
+    hud_tty_restore();
+    if (g_vt_enabled) { printf("\033[r\033[0m\033[2J\033[H\033[?25h"); fflush(stdout); }
     agent_log(LOG_LVL_INFO, "Agent stopped.");
     return 0;
 }

@@ -42,6 +42,7 @@ typedef struct {
     float input, burst;           /* external drive: level (decays), short bursts */
     float level, energy, think, voice, spin, t, pulse_age;
     float col[3][3];
+    float particle_gain, glow_gain;   /* 1 = desktop; lower for tiny canvases (terminal) */
 } orb_t;
 
 static inline float orb__clampf(float v, float a, float b) { return v < a ? a : v > b ? b : v; }
@@ -63,6 +64,7 @@ static inline void orb_init(orb_t *o) {
     }
     o->state = ORB_OFFLINE;
     o->pulse_age = 9.f;
+    o->particle_gain = 1.f; o->glow_gain = 1.f;
     for (int k = 0; k < 3; k++) for (int c = 0; c < 3; c++) o->col[k][c] = ORB_PALETTE[ORB_OFFLINE][k][c];
 }
 
@@ -151,7 +153,8 @@ static inline void orb_render(orb_t *o, orb_surface *s, float cx, float cy, floa
     R *= 1.f + 0.06f * level + 0.05f * pulse * pulse;
 
     /* halo */
-    orb__glow(s, cx, cy, R * (2.0f + 0.5f * energy), o->col[1], 0.30f + 0.28f * energy, o->col[0], 0.10f + 0.08f * energy, 0.45f);
+    float gg = o->glow_gain, pg = o->particle_gain;
+    orb__glow(s, cx, cy, R * (2.0f + 0.5f * energy), o->col[1], (0.30f + 0.28f * energy) * gg, o->col[0], (0.10f + 0.08f * energy) * gg, 0.45f);
 
     /* event ring */
     if (pulse > 0.f) {
@@ -182,13 +185,13 @@ static inline void orb_render(orb_t *o, orb_surface *s, float cx, float cy, floa
         if (m < 0.5f) { f = m * 2.f; f = f * f * (3 - 2 * f); orb__mix(o->col[0], o->col[1], f, c); }
         else { f = (m - 0.5f) * 2.f; f = f * f * (3 - 2 * f); orb__mix(o->col[1], o->col[2], f, c); }
         orb__white(c, 0.25f * depth * depth, c);
-        float a = (0.10f + 0.85f * depth * depth) * (0.75f + 0.25f * energy);
+        float a = (0.10f + 0.85f * depth * depth) * (0.75f + 0.25f * energy) * pg;
         orb__splat(s, cx + x1 * R * k, cy + y2 * R * k, dot * (0.7f + 1.7f * depth) * k * 0.5f, c, a);
     }
 
     /* core */
     float core[3]; orb__white(o->col[2], 0.55f, core);
-    orb__glow(s, cx, cy, R * (0.62f + 0.18f * level), core, 0.50f + 0.35f * level, o->col[0], 0.28f, 0.35f);
+    orb__glow(s, cx, cy, R * (0.62f + 0.18f * level), core, (0.50f + 0.35f * level) * gg, o->col[0], 0.28f * gg, 0.35f);
 
     /* ribbons through the equator: filled band + bright edge, faded at both ends */
     float span = R * 1.55f;
