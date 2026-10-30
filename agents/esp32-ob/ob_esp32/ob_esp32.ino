@@ -2,8 +2,11 @@
  *
  * Unity-builds the shared dependency-free core in ../proto/ (sha256 + obproto),
  * so the firmware on silicon is byte-identical logic to the host-tested code.
- * Transports: WiFi TCP to the master daemon; Serial selftest + Serial gateway
- * framing (line-delimited JSON) for USB and emulated runs.
+ * Transports: WiFi TCP to the master daemon (default build), or raw v4 frames
+ * over Serial with -DOB_NO_WIFI (QEMU has no WiFi radio; the same build also
+ * runs on physical hardware over USB serial). Serial mode emits one OB-SER-SYNC
+ * marker line, then pure v4 bytes; the host gateway drops everything before
+ * the marker (ROM bootloader chatter) and pipes the rest to the master.
  * UI: ILI9341 TFT, OpenBridge identity (dark bg, cyan accent, orb-ish rings).
  *
  * Wiring (ESP32-DevKit + ILI9341):
@@ -108,7 +111,62 @@ static void fw_emit(void *c, const char *line) {
     Serial.println(line);
 }
 
+#ifdef OB_NO_WIFI
+#define SER_LOG(x) ((void)0)   /* serial mode: pure v4 bytes, no log pollution */
+static void fw_emit_null(void *c, const char *line) { (void)c; (void)line; }
+#else
+#define SER_LOG(x) Serial.println(x)
+#endif
+
+#ifdef OB_NO_WIFI
+#include "soc/uart_reg.h"
+/* Direct UART0 register access: the Arduino Serial ISR path trips QEMU-ESP32's
+ * cache model (Guru "Cache disabled" panic via FreeRTOS IPC). Polling the
+ * FIFO registers involves no ISR, no FreeRTOS call, no waiti. */
+void IRAM_ATTR ob_keeper_task(void *arg) {
+    (void)arg;
+    for (;;) { __asm__ volatile("nop"); }
+}
+
+static void ser_hw_init(void) {
+    /* Silence UART interrupts; we poll. Keep the baud set by Serial.begin(). */
+    CLEAR_PERI_REG_MASK(UART_INT_ENA_REG(0), 0xffffffffu);
+    WRITE_PERI_REG(UART_INT_CLR_REG(0), 0xffffffffu);
+}
+
+static int ser_read(void *c, unsigned char *buf, int len, int timeout_ms) {
+    (void)c;
+    unsigned long t0 = millis();
+    int got = 0;
+    while (got < len) {
+        uint32_t st = REG_READ(UART_STATUS_REG(0));
+        uint32_t cnt = (st >> UART_RXFIFO_CNT_S) & UART_RXFIFO_CNT_V;
+        while (cnt-- > 0 && got < len)
+            buf[got++] = (unsigned char)(REG_READ(UART_FIFO_REG(0)) & 0xffu);
+        if (got == len || (int)(millis() - t0) > timeout_ms)
+            break;
+    }
+    return got; /* 0 = timeout; partials accumulate in read_full */
+}
+
+static int ser_write(void *c, const unsigned char *buf, int len) {
+    (void)c;
+    int sent = 0;
+    while (sent < len) {
+        uint32_t st = REG_READ(UART_STATUS_REG(0));
+        uint32_t used = (st >> UART_TXFIFO_CNT_S) & UART_TXFIFO_CNT_V;
+        if (used < 120) {
+            REG_WRITE(UART_FIFO_REG(0), buf[sent++]);
+        }
+    }
+    return sent;
+}
+#endif
+
 static void ui_state(const char *state, uint16_t col, const char *sub) {
+#ifdef OB_NO_WIFI
+    (void)state; (void)col; (void)sub; /* no display in emulation */
+#else
     tft.fillScreen(COL_BG);
     tft.setTextColor(COL_CYAN);
     tft.setTextSize(2);
@@ -136,9 +194,13 @@ static void ui_state(const char *state, uint16_t col, const char *sub) {
     tft.print("IN/OUT MACs: v4");
     tft.setCursor(12, 274);
     tft.print(g_last_op);
+#endif
 }
 
 static void ui_splash(const char *l1, const char *l2) {
+#ifdef OB_NO_WIFI
+    (void)l1; (void)l2;
+#else
     tft.fillScreen(COL_BG);
     tft.setTextColor(COL_CYAN);
     tft.setTextSize(2);
@@ -152,21 +214,42 @@ static void ui_splash(const char *l1, const char *l2) {
     tft.setTextSize(1);
     tft.setCursor(12, 160);
     tft.print(l2);
+#endif
 }
 
 void setup() {
     Serial.begin(115200);
     pinMode(LED_BUILTIN, OUTPUT);
+#ifndef OB_NO_WIFI
     tft.begin();
     tft.setRotation(1);
+#endif
     ui_splash("ESP32 agent", "selftest...");
-    Serial.println("OB-ESP32 boot");
+    SER_LOG("OB-ESP32 boot");
+#ifdef OB_NO_WIFI
+    if (ob_selftest(fw_emit_null, NULL) != 0) {
+#else
     if (ob_selftest(fw_emit, NULL) != 0) {
+#endif
         ui_splash("SELFTEST FAIL", "halted");
-        Serial.println("SELFTEST FAIL, halting");
+        SER_LOG("SELFTEST FAIL, halting");
         for (;;)
             delay(1000);
     }
+#ifdef OB_NO_WIFI
+    /* Minimal QEMU path: no TFT (no pixels in emulation), straight to the gateway.
+     * Core 0's flash cache is unusable under QEMU-ESP32 (idle waiti and any
+     * flash code fault), so park it in an IRAM-resident busy task at prio 1:
+     * the idle task (flash) then never runs there. Core 1 runs the app. */
+    extern void ob_keeper_task(void *);
+    xTaskCreatePinnedToCore(ob_keeper_task, "noboot", 1024, NULL, 1, NULL, 0);
+    ser_hw_init();
+    { static const char sync_mark[] = "OB-SER-SYNC\r\n"; /* gateway sync marker */
+      ser_write(NULL, (const unsigned char *)sync_mark, sizeof(sync_mark) - 1); }
+    memset(&g_agent, 0, sizeof(g_agent));
+    g_agent.read = ser_read;
+    g_agent.write = ser_write;
+#else
     ui_splash("WiFi...", OB_WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(OB_WIFI_SSID, OB_WIFI_PASS);
@@ -177,7 +260,7 @@ void setup() {
     }
     if (WiFi.status() != WL_CONNECTED) {
         ui_state("NO WIFI", COL_AMBER, "serial selftest OK");
-        Serial.println("NO WIFI (serial selftest OK)");
+        SER_LOG("NO WIFI (serial selftest OK)");
         return;
     }
     {
@@ -187,33 +270,43 @@ void setup() {
     }
     if (!g_cli.connect(OB_MASTER_HOST, OB_MASTER_PORT)) {
         ui_state("NO MASTER", COL_AMBER, OB_MASTER_HOST);
-        Serial.println("master connect failed");
+        SER_LOG("master connect failed");
         return;
     }
     memset(&g_agent, 0, sizeof(g_agent));
     g_agent.read = fw_read;
     g_agent.write = fw_write;
+#endif
     g_agent.millis = fw_millis;
     g_agent.nonce = fw_nonce;
     g_agent.ctx = NULL;
     if (ob_handshake(&g_agent, OB_AGENT_ID, OB_PSK) != 0) {
         ui_state("AUTH FAIL", COL_AMBER, "check PSK");
-        Serial.println("handshake failed");
+        SER_LOG("handshake failed");
+#ifndef OB_NO_WIFI
         g_cli.stop();
+#endif
         return;
     }
     g_handshake_ok = 1;
     digitalWrite(LED_BUILTIN, HIGH);
     snprintf(g_last_op, sizeof(g_last_op), "linked %s", OB_MASTER_HOST);
     ui_state("READY", COL_GREEN, g_last_op);
-    Serial.println("AUTH_OK");
+    SER_LOG("AUTH_OK");
 }
 
 void loop() {
+#ifdef OB_NO_WIFI
+    if (!g_handshake_ok) {
+        for (volatile int i = 0; i < 1000; i++) { } /* no delay(): QEMU waiti panic */
+        return;
+    }
+#else
     if (!g_handshake_ok || !g_cli.connected()) {
         delay(1000);
         return;
     }
+#endif
     /* Serve one request per loop iteration to keep the UI alive. */
     int r = ob_serve(&g_agent, 1);
     if (r > 0) {
@@ -221,8 +314,10 @@ void loop() {
         ui_state("READY", COL_GREEN, g_last_op);
     } else if (r < 0) {
         ui_state("LINK LOST", COL_AMBER, "reboot to rejoin");
-        Serial.println("serve error, halting");
+        SER_LOG("serve error, halting");
+#ifndef OB_NO_WIFI
         g_cli.stop();
+#endif
         g_handshake_ok = 0;
     }
 }
