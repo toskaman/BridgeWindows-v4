@@ -27,6 +27,7 @@ static int beep_flash = 0;
 static int selftest_ok = -1;      /* -1 not run, 0 fail, 1 ok */
 static int access_granted = 0;    /* owner allowed this host:port */
 static int access_waiting = 0;
+static int access_denied = 0;     /* remembered deny: back off, show state */
 static int tcp_open = 0;
 static int tcp_err = 0;
 static int tcp_opens = 0;
@@ -42,6 +43,7 @@ static int last_recv_err = 0;
 
 static int pd_send(void *ctx, const void *buf, size_t len) {
     size_t o = 0;
+    if (!conn) return -1;
     unsigned start = pd->system->getCurrentTimeMilliseconds();
     (void)ctx;
     while (o < len) {
@@ -59,6 +61,7 @@ static int pd_send(void *ctx, const void *buf, size_t len) {
 
 static int pd_recv(void *ctx, void *buf, size_t len) {
     size_t o = 0;
+    if (!conn) return -1;
     unsigned start = pd->system->getCurrentTimeMilliseconds();
     (void)ctx;
     while (o < len) {
@@ -71,7 +74,7 @@ static int pd_recv(void *ctx, void *buf, size_t len) {
             if (agent.io_timeout_ms > 0 && (int)(now - start) > agent.io_timeout_ms) return -2;
             continue; /* handshake: wait for the first byte */
         }
-        if (o > 0 && agent.io_timeout_ms > 0 && (int)(now - start) > agent.io_timeout_ms) return -2;
+        if (o > 0 && agent.io_timeout_ms > 0 && (int)(now - start) > agent.io_timeout_ms) return -1; /* -2 only when o==0: mid-frame timeout discarded bytes, never retry */
         if (avail == 0) continue;
         want = len - o;
         if (want > avail) want = avail;
@@ -123,10 +126,10 @@ static void read_config(void) {
         *eq = 0;
         vlen = strlen(eq + 1);
         while (vlen && (eq[vlen] == '\r' || eq[vlen] == '\n')) eq[vlen--] = 0;
-        if (!strcmp(line, "host")) { strncpy(cfg_host, eq + 1, sizeof(cfg_host) - 1); }
-        else if (!strcmp(line, "port")) { cfg_port = atoi(eq + 1); }
-        else if (!strcmp(line, "psk")) { strncpy(cfg_psk, eq + 1, sizeof(cfg_psk) - 1); }
-        else if (!strcmp(line, "agent_id")) { strncpy(cfg_id, eq + 1, sizeof(cfg_id) - 1); }
+        if (!strcmp(line, "host")) { strncpy(cfg_host, eq + 1, sizeof(cfg_host) - 1); cfg_host[sizeof(cfg_host)-1] = 0; }
+        else if (!strcmp(line, "port")) { cfg_port = atoi(eq + 1); if (cfg_port < 1 || cfg_port > 65535) cfg_port = 19991; }
+        else if (!strcmp(line, "psk")) { strncpy(cfg_psk, eq + 1, sizeof(cfg_psk) - 1); cfg_psk[sizeof(cfg_psk)-1] = 0; }
+        else if (!strcmp(line, "agent_id")) { strncpy(cfg_id, eq + 1, sizeof(cfg_id) - 1); cfg_id[sizeof(cfg_id)-1] = 0; }
     }
 }
 
@@ -153,6 +156,7 @@ static void access_cb(bool allowed, void *ud) {
     (void)ud;
     access_waiting = 0;
     access_granted = allowed ? 1 : 0;
+    access_denied = allowed ? 0 : 1;
     pd->system->logToConsole("OpenBridge TCP access: %s", allowed ? "allowed" : "denied");
 }
 
@@ -166,6 +170,7 @@ static void open_cb(TCPConnection *c, PDNetErr err, void *ud) {
     } else {
         tcp_open = 0;
         tcp_err = err;
+        if (conn) { tcp->close(conn); conn = NULL; } /* else the link sticks: no redial */
         pd->system->logToConsole("OpenBridge TCP open failed: %d", err);
     }
 }
@@ -184,12 +189,14 @@ static void link_tick(void) {
     static int boot_frames = 0;
     if (!tcp) return;
     if (boot_frames++ < 90) return; /* show boot UI + selftest before asking consent */
+    if (!cfg_psk[0]) return; /* no PSK: stay put, UI says so */
     if (!access_granted && !access_waiting) {
         enum accessReply r;
+        if (access_denied && now - last_open_ms < 5000) return; /* sync-deny backoff */
         access_waiting = 1;
         r = tcp->requestAccess(cfg_host, cfg_port, false, "OpenBridge agent link", access_cb, NULL);
-        if (r == kAccessDeny) { access_waiting = 0; }
-        else if (r == kAccessAllow) { access_waiting = 0; access_granted = 1; }
+        if (r == kAccessDeny) { access_waiting = 0; access_denied = 1; last_open_ms = now; }
+        else if (r == kAccessAllow) { access_waiting = 0; access_granted = 1; access_denied = 0; }
         return;
     }
     if (access_granted && !conn && now - last_open_ms > 2000) {
@@ -218,7 +225,7 @@ static void auth_tick(void) {
       } else {
           hs_tries++;
           /* drop a half-shaken connection: no stale reply may desync the retry */
-          if (conn) { tcp->close(conn); conn = NULL; }
+          if (conn) { tcp->close(conn); conn = NULL; tcp_drops++; }
           tcp_open = 0;
       } }
 }
@@ -266,7 +273,7 @@ static void draw_ui(void) {
     }
     snprintf(line, sizeof(line), "OPENBRIDGE  %s", agent.agent_id);
     text(8, 5, line);
-    snprintf(line, sizeof(line), "LINK: %s", !tcp ? "no TCP API" : !access_granted ? (access_waiting ? "consent?" : "ask") : !tcp_open ? (tcp_err ? "open failed" : "dial") : "open");
+    snprintf(line, sizeof(line), "LINK: %s", !cfg_psk[0] ? "no PSK (edit obconfig.txt)" : !tcp ? "no TCP API" : !access_granted ? (access_denied ? "denied" : access_waiting ? "consent?" : "ask") : !tcp_open ? (tcp_err ? "open failed" : "dial") : "open");
     text(150, 36, line);
     snprintf(line, sizeof(line), "AUTH: %s (tries %d st%d e%d)", agent.authed ? "yes" : "no", hs_tries, agent.hs_stage, agent.hs_err);
     text(150, 58, line);
@@ -278,7 +285,8 @@ static void draw_ui(void) {
     snprintf(line, sizeof(line), "SELFTEST: %s", selftest_ok < 0 ? "..." : selftest_ok ? "OK" : "FAIL");
     text(150, 102, line);
     text(150, 124, "MSG:");
-    text(150, 142, display_msg[0] ? display_msg : "(none yet)");
+    { char short_msg[44]; snprintf(short_msg, sizeof(short_msg), "%.40s", display_msg);
+    text(150, 142, display_msg[0] ? short_msg : "(none yet)"); }
     text(8, 200, "A/B/dpad/crank: notify bridge");
     text(8, 218, "bridge->exec screen.text: shows MSG");
 }
@@ -292,8 +300,7 @@ static int update(void *userdata) {
     if (tcp_open && agent.authed) {
         if (ob_poll(&agent) < 0) {
             /* fatal: drop and redial */
-            tcp->close(conn);
-            conn = NULL;
+            if (conn) { tcp->close(conn); conn = NULL; }
             tcp_open = 0;
             agent.authed = 0;
             pd->system->logToConsole("OpenBridge link dropped, redial");
@@ -317,8 +324,8 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
         srand(pd->system->getCurrentTimeMilliseconds());
         read_config();
         memset(&agent, 0, sizeof(agent));
-        strncpy(agent.agent_id, cfg_id, sizeof(agent.agent_id) - 1);
-        strncpy(agent.psk, cfg_psk, sizeof(agent.psk) - 1);
+        strncpy(agent.agent_id, cfg_id, sizeof(agent.agent_id) - 1); agent.agent_id[sizeof(agent.agent_id)-1] = 0;
+        strncpy(agent.psk, cfg_psk, sizeof(agent.psk) - 1); agent.psk[sizeof(agent.psk)-1] = 0;
         strcpy(agent.arch, "playdate");
         agent.send_all = pd_send;
         agent.recv_all = pd_recv;

@@ -31,7 +31,8 @@ typedef struct {
     void *io_ctx;
     int io_timeout_ms;    /* recv idle budget; 0 = wait forever (host default) */
     int io_blocking;      /* recv waits up to io_timeout_ms for the first byte (handshake); 0 = instant -2 (serve poll) */
-    int hs_stage;         /* handshake diagnostics: last stage reached (0..7) */
+    int hs_stage;         /* handshake diagnostics: 0 none, 1 hello sent, 2 challenge read, 3 challenge ok,
+                                     4 response sent, 5 confirm read, 6 confirm ok, 7 authed */
     int hs_err;           /* last handshake recv error (-2 timeout, -1 error) */
     ob_action_fn action;
     void *action_ctx;
@@ -49,9 +50,6 @@ size_t ob_b64dec(const char *in, size_t len, unsigned char *out, size_t outsize)
 /* One handshake over the configured transport. Returns 0 + authed=1 on success. */
 int ob_handshake(ob_agent *a, const char *agent_nonce_hex);
 
-/* Serve loop: answer up to max_rpc requests (0 = forever). Returns 0 when
- * max_rpc is reached or when the transport idles/closes after >=1 served RPC
- * or >=1 sent notification; -1 only when nothing was served (early failure). */
 /* One serve iteration: 1 = served one RPC, 0 = idle (io timeout, retry),
  * -1 = fatal (MAC failure, close, corrupt frame). Frame-driven transports
  * (Playdate update loop) call this every tick; it never blocks past
