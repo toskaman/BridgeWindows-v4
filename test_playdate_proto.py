@@ -161,6 +161,31 @@ class PlaydateProtoTests(unittest.TestCase):
         finally:
             self._stop(b)
 
+    def test_ob_poll_instant_idle_path(self):
+        # Device-faithful poll: instant -2 when idle (no 15s select wait),
+        # like pd_recv between frames. Must still serve both RPCs.
+        b = self._bridge()
+        try:
+            p = self._run_agent("PD-POLLI", "--poll", "2", "--poll-instant")
+            try:
+                self._wait_agent(b, "PD-POLLI")
+                pong = b.send_rpc("sys.ping", {}, agent_id="PD-POLLI",
+                                  timeout=10)
+                self.assertTrue(pong.get("result", {}).get("pong"), pong)
+                # let the instant-idle path spin with no data pending
+                time.sleep(0.5)
+                diag = b.send_rpc("sys.diag", {}, agent_id="PD-POLLI",
+                                  timeout=10)
+                self.assertIn("hostname", diag.get("result", {}), diag)
+                out, _ = p.communicate(timeout=20)
+                self.assertIn("POLL_INSTANT", out)
+                self.assertIn("POLL_OK 2", out)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+        finally:
+            self._stop(b)
+
     def test_button_notification_reaches_bridge(self):
         b = self._bridge()
         try:

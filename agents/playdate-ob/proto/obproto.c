@@ -102,6 +102,7 @@ static int consttime_eq(const char *a, const char *b, size_t n) {
 }
 
 int ob_handshake(ob_agent *a, const char *agent_nonce_hex) {
+    a->hs_stage = 0; a->hs_err = 0;
     char hello[512], resp[512], frame[2048], mnonce[65], expect[65];
     char pskhex[65];
     size_t flen;

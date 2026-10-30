@@ -35,14 +35,16 @@ static int tcp_send(void *ctx, const void *buf, size_t len) {
     return 0;
 }
 
+static int g_instant; /* --poll-instant: device-faithful zero-wait idle (test only) */
+
 static int tcp_recv(void *ctx, void *buf, size_t len) {
     sock_t s = *(sock_t*)ctx;
     size_t o = 0;
     while (o < len) {
         fd_set rf; struct timeval tv; int n;
         FD_ZERO(&rf); FD_SET(s, &rf);
-        tv.tv_sec = 15; tv.tv_usec = 0; /* idle 15s (ESP32 parity) -> serve exits */
-        { int _s = select((int)(s + 1), &rf, 0, 0, &tv); if (_s == 0) return -2; if (_s < 0) return -1; }
+        tv.tv_sec = g_instant ? 0 : 15; tv.tv_usec = 0; /* idle 15s (ESP32 parity) -> serve exits */
+        { int _s = select((int)(s + 1), &rf, 0, 0, &tv); if (_s == 0) return (o == 0) ? -2 : -1; if (_s < 0) return -1; }
         n = recv(s, (char*)buf + o, (int)(len - o), 0);
         if (n <= 0) return -1;
         o += (size_t)n;
@@ -113,6 +115,13 @@ static const char *flag(int argc, char **argv, const char *name) {
     return 0;
 }
 
+static int hasflag(int argc, char **argv, const char *name) {
+    int i;
+    for (i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], name)) return 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *host, *token, *agent_id;
     int port, once;
@@ -156,10 +165,18 @@ int main(int argc, char **argv) {
     { const char *pl = flag(argc, argv, "--poll");
       if (pl && atoi(pl) > 0) { /* frame-stepped path (what the Playdate update loop drives) */
           int want = atoi(pl), served = 0;
+          if (hasflag(argc, argv, "--poll-instant")) { g_instant = 1; printf("POLL_INSTANT\n"); fflush(stdout); }
           for (;;) {
               int r = ob_poll(&a);
               if (r < 0) return 1;
-              if (r == 0) continue; /* idle tick: no data yet */
+              if (r == 0) {
+#ifdef _WIN32
+                  Sleep(1);
+#else
+                  usleep(1000);
+#endif
+                  continue; /* idle tick: no data yet */
+              }
               served++;
               printf("POLL_OK %d\n", served); fflush(stdout);
               if (served >= want) break;
