@@ -16,7 +16,7 @@ if errorlevel 1 set FAIL=1
 :: 2. Windows ARM64 (zig cross)
 echo [BUILD] win-arm64: agent.c + gui.c -^> agent_arm64.exe
 if not exist %ZIG% ( echo [WARN] zig not found, skipping arm64. ) else (
-    %ZIG% cc -target aarch64-windows -O2 -s agent.c gui.c -o agent_arm64.exe -lws2_32 -ladvapi32 -luser32 -lgdi32 -lpsapi -lbcrypt -lcomctl32 -lshell32 2>nul
+    %ZIG% cc -target aarch64-windows -O2 -s -Wl,--subsystem,windows agent.c gui.c -o agent_arm64.exe -lws2_32 -ladvapi32 -luser32 -lgdi32 -lpsapi -lbcrypt -lcomctl32 -lshell32 2>nul
     if errorlevel 1 ( echo [ERROR] win-arm64 failed. & set FAIL=1 ) else (
         for %%I in (agent_arm64.exe) do echo [SUCCESS] agent_arm64.exe win-arm64 %%~zI bytes
     )

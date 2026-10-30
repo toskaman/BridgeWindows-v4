@@ -4,13 +4,24 @@
  * Footprint: < 3.5 MB RAM, Single Portable .exe, Native Win32 + CNG (bcrypt.dll)
  */
 
+#ifdef _WIN32_WINNT
+#undef _WIN32_WINNT /* zig predefines 0x0A00; we choose per-target below */
+#endif
+#ifdef AGENT_LEGACY_XP
+#define _WIN32_WINNT 0x0501 /* XP/2003: no CNG, no TokenElevation, no GetTickCount64 */
+#else
 #define _WIN32_WINNT 0x0601
+#endif
 #define PSAPI_VERSION 1
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#ifdef AGENT_LEGACY_XP
+#include <wincrypt.h> /* CryptoAPI: same SHA-256/HMAC digests as CNG */
+#else
 #include <bcrypt.h>
+#endif
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <wingdi.h>
@@ -26,6 +37,8 @@
 #include <stdbool.h>
 #include <time.h>
 #include <math.h>
+#include <io.h>      /* _open_osfhandle/_dup2: ANSI bridge for pre-Win10 consoles */
+#include <fcntl.h>
 
 #include "protocol.h"
 #include "gui.h"
@@ -58,6 +71,236 @@
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
+
+#ifdef AGENT_LEGACY_XP
+/* XP compatibility shims. Same wire digests/timestamps as the CNG path. */
+static uint64_t legacy_tick64(void) {
+    static DWORD last = 0;
+    static uint64_t base = 0;
+    DWORD now = GetTickCount();
+    if (now < last) base += (uint64_t)1 << 32; /* 49.7-day wrap */
+    last = now;
+    return base + now;
+}
+#define GetTickCount64() legacy_tick64()
+
+static BOOL legacy_is_admin(void) {
+    /* Manual TokenGroups walk: compare SIDs directly instead of
+     * CheckTokenMembership (fewer API dependencies on XP).
+     * Administrators present+enabled => admin (no UAC on XP). */
+    HANDLE tok = NULL;
+    DWORD len = 0;
+    TOKEN_GROUPS *groups = NULL;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID admin_sid = NULL;
+    BOOL ok = FALSE;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return FALSE;
+    GetTokenInformation(tok, TokenGroups, NULL, 0, &len);
+    groups = (TOKEN_GROUPS *)malloc(len ? len : 1);
+    if (groups && GetTokenInformation(tok, TokenGroups, groups, len, &len)
+        && AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admin_sid)) {
+        for (DWORD i = 0; i < groups->GroupCount; i++) {
+            if ((groups->Groups[i].Attributes & SE_GROUP_ENABLED)
+                && EqualSid(groups->Groups[i].Sid, admin_sid)) {
+                ok = TRUE;
+                break;
+            }
+        }
+        FreeSid(admin_sid);
+    }
+    free(groups);
+    CloseHandle(tok);
+    return ok;
+}
+
+#ifndef MS_ENH_RSA_AES_PROV_A
+#define MS_ENH_RSA_AES_PROV_A "Microsoft Enhanced RSA and AES Cryptographic Provider"
+#endif
+#ifndef PROV_RSA_AES
+#define PROV_RSA_AES 24
+#endif
+#ifndef CALG_SHA_256
+#define CALG_SHA_256 0x800c
+#endif
+#ifndef CRYPT_IPSEC_HMAC_KEY
+#define CRYPT_IPSEC_HMAC_KEY 0x00000100
+#endif
+
+static void legacy_hex32(const unsigned char h[32], char out65[65]) {
+    for (int i = 0; i < 32; ++i) snprintf(out65 + (i * 2), 3, "%02x", h[i]);
+    out65[64] = '\0';
+}
+
+/* Software SHA-256 (FIPS 180-4). XP's rsaenh has no usable SHA-256 provider
+ * (PROV_RSA_AES/CALG_SHA_256 fails on XP SP3 VL), so the legacy build hashes
+ * in-process. Wire digests are identical by construction; --selftest asserts
+ * SHA256("selftest") and the RFC 4231 HMAC-SHA256 vector on every build. */
+static const uint32_t sw_sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define SW_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SW_CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define SW_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define SW_BSIG0(x) (SW_ROTR(x, 2) ^ SW_ROTR(x, 13) ^ SW_ROTR(x, 22))
+#define SW_BSIG1(x) (SW_ROTR(x, 6) ^ SW_ROTR(x, 11) ^ SW_ROTR(x, 25))
+#define SW_SSIG0(x) (SW_ROTR(x, 7) ^ SW_ROTR(x, 18) ^ ((x) >> 3))
+#define SW_SSIG1(x) (SW_ROTR(x, 17) ^ SW_ROTR(x, 19) ^ ((x) >> 10))
+
+typedef struct {
+    uint32_t h[8];
+    uint64_t total_len;
+    unsigned char buf[64];
+    size_t buf_len;
+} capi_sha256_stream; /* name kept for the guarded call sites; software-backed */
+
+static void sw_sha256_block(capi_sha256_stream *s, const unsigned char blk[64]) {
+    uint32_t w[64];
+    uint32_t a, b, c, d, e, f, g, hh, t1, t2;
+    for (int i = 0; i < 16; ++i) {
+        w[i] = ((uint32_t)blk[i * 4] << 24) | ((uint32_t)blk[i * 4 + 1] << 16)
+             | ((uint32_t)blk[i * 4 + 2] << 8) | (uint32_t)blk[i * 4 + 3];
+    }
+    for (int i = 16; i < 64; ++i) {
+        w[i] = SW_SSIG1(w[i - 2]) + w[i - 7] + SW_SSIG0(w[i - 15]) + w[i - 16];
+    }
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
+    e = s->h[4]; f = s->h[5]; g = s->h[6]; hh = s->h[7];
+    for (int i = 0; i < 64; ++i) {
+        t1 = hh + SW_BSIG1(e) + SW_CH(e, f, g) + sw_sha256_k[i] + w[i];
+        t2 = SW_BSIG0(a) + SW_MAJ(a, b, c);
+        hh = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += hh;
+}
+
+static bool capi_stream_init(capi_sha256_stream *s) {
+    s->h[0] = 0x6a09e667; s->h[1] = 0xbb67ae85;
+    s->h[2] = 0x3c6ef372; s->h[3] = 0xa54ff53a;
+    s->h[4] = 0x510e527f; s->h[5] = 0x9b05688c;
+    s->h[6] = 0x1f83d9ab; s->h[7] = 0x5be0cd19;
+    s->total_len = 0;
+    s->buf_len = 0;
+    return true;
+}
+
+static bool capi_stream_update(capi_sha256_stream *s, const unsigned char *d, size_t n) {
+    if (n == 0) return true;
+    if (!d) return false;
+    s->total_len += (uint64_t)n;
+    while (n > 0) {
+        size_t take = 64 - s->buf_len;
+        if (take > n) take = n;
+        memcpy(s->buf + s->buf_len, d, take);
+        s->buf_len += take;
+        d += take;
+        n -= take;
+        if (s->buf_len == 64) {
+            sw_sha256_block(s, s->buf);
+            s->buf_len = 0;
+        }
+    }
+    return true;
+}
+
+static bool capi_stream_final(capi_sha256_stream *s, unsigned char out32[32]) {
+    uint64_t bit_len = s->total_len * 8;
+    unsigned char pad = 0x80;
+    unsigned char zero = 0x00;
+    unsigned char len_be[8];
+    for (int i = 0; i < 8; ++i) {
+        len_be[i] = (unsigned char)((bit_len >> (56 - i * 8)) & 0xff);
+    }
+    /* pad: 0x80 then zeros until length == 56 (mod 64), then 64-bit length */
+    if (s->buf_len >= 56) {
+        capi_stream_update(s, &pad, 1);
+        while (s->buf_len != 0) capi_stream_update(s, &zero, 1);
+    } else {
+        capi_stream_update(s, &pad, 1);
+    }
+    while (s->buf_len != 56) capi_stream_update(s, &zero, 1);
+    /* length block: feed raw (total_len must NOT grow) */
+    memcpy(s->buf + 56, len_be, 8);
+    sw_sha256_block(s, s->buf);
+    s->buf_len = 0;
+    for (int i = 0; i < 8; ++i) {
+        out32[i * 4] = (unsigned char)((s->h[i] >> 24) & 0xff);
+        out32[i * 4 + 1] = (unsigned char)((s->h[i] >> 16) & 0xff);
+        out32[i * 4 + 2] = (unsigned char)((s->h[i] >> 8) & 0xff);
+        out32[i * 4 + 3] = (unsigned char)(s->h[i] & 0xff);
+    }
+    return true;
+}
+
+static bool capi_hmac_sha256_raw(const unsigned char *key, size_t keylen,
+        const unsigned char *data, size_t len, unsigned char out32[32]) {
+    unsigned char k0[64];
+    unsigned char inner[32];
+    capi_sha256_stream st;
+    size_t i;
+    if (!key || keylen == 0 || keylen > 4096 || (!data && len > 0)) return false;
+    memset(k0, 0, sizeof(k0));
+    if (keylen > 64) {
+        if (!capi_stream_init(&st)) return false;
+        if (!capi_stream_update(&st, key, keylen)) return false;
+        if (!capi_stream_final(&st, k0)) return false;
+    } else {
+        memcpy(k0, key, keylen);
+    }
+    for (i = 0; i < 64; ++i) k0[i] ^= 0x36;
+    if (!capi_stream_init(&st)) return false;
+    if (!capi_stream_update(&st, k0, 64)) return false;
+    if (len > 0 && !capi_stream_update(&st, data, len)) return false;
+    if (!capi_stream_final(&st, inner)) return false;
+    for (i = 0; i < 64; ++i) k0[i] ^= (0x36 ^ 0x5c);
+    if (!capi_stream_init(&st)) return false;
+    if (!capi_stream_update(&st, k0, 64)) return false;
+    if (!capi_stream_update(&st, inner, 32)) return false;
+    if (!capi_stream_final(&st, out32)) return false;
+    return true;
+}
+
+static BOOL legacy_proc_image(HANDLE hProc, char *out, DWORD cap) {
+    DWORD n = GetModuleFileNameExA(hProc, NULL, out, cap); /* psapi: XP inbox */
+    return n > 0 && n < cap;
+}
+
+static bool capi_rng(unsigned char *out, size_t n) {
+    HCRYPTPROV hProv = 0;
+    /* Default provider (always present, even on XP) for RNG only. */
+    if (CryptAcquireContextA(&hProv, NULL, MS_DEF_PROV_A, PROV_RSA_FULL,
+            CRYPT_VERIFYCONTEXT)) {
+        BOOL ok = CryptGenRandom(hProv, (DWORD)n, out);
+        CryptReleaseContext(hProv, 0);
+        if (ok) return true;
+    }
+    /* Last-resort uniqueness fallback (non-crypto): time + pid + counter. */
+    {
+        static volatile LONG ctr = 0;
+        DWORD seed = GetTickCount() ^ (GetCurrentProcessId() << 16)
+            ^ (DWORD)InterlockedIncrement(&ctr);
+        LARGE_INTEGER pc;
+        QueryPerformanceCounter(&pc);
+        seed ^= (DWORD)pc.LowPart ^ (DWORD)pc.HighPart;
+        srand(seed);
+        for (size_t i = 0; i < n; ++i) out[i] = (unsigned char)((rand() >> 7) & 0xff);
+    }
+    return true;
+}
+#endif /* AGENT_LEGACY_XP */
 
 /* =========================================================================
  * GLOBAL STATE & SYNCHRONIZATION
@@ -190,6 +433,44 @@ static void agent_log(LogLevel lvl, const char *fmt, ...) {
 }
 
 /* =========================================================================
+ * LIVE FLOW FEED for the status window: one entry per message that crosses
+ * the link (direction, short label, size). Read by gui.c via bw_drain_flows().
+ * ========================================================================= */
+#define BW_FLOW_CAP 128
+typedef struct { uint64_t seq; int dir; uint64_t bytes; char label[48]; } FlowEntry;
+static FlowEntry g_flow_ring[BW_FLOW_CAP];
+static uint64_t g_flow_seq = 0;
+static CRITICAL_SECTION g_flow_lock;
+static volatile LONG g_flow_ready = 0;
+
+static void bw_flow_push(int dir, const char *label, uint64_t bytes) {
+    if (!InterlockedCompareExchange(&g_flow_ready, 1, 1)) return;
+    EnterCriticalSection(&g_flow_lock);
+    uint64_t sq = ++g_flow_seq;
+    FlowEntry *e = &g_flow_ring[sq % BW_FLOW_CAP];
+    e->seq = sq; e->dir = dir; e->bytes = bytes;
+    strncpy(e->label, label ? label : "?", sizeof(e->label) - 1);
+    e->label[sizeof(e->label) - 1] = '\0';
+    LeaveCriticalSection(&g_flow_lock);
+}
+
+int bw_drain_flows(uint64_t *last_seq, bw_flow_cb cb, void *ctx) {
+    if (!last_seq || !cb || !InterlockedCompareExchange(&g_flow_ready, 1, 1)) return -1;
+    FlowEntry out[BW_FLOW_CAP]; int n = 0;
+    EnterCriticalSection(&g_flow_lock);
+    uint64_t first = *last_seq + 1;
+    if (g_flow_seq >= BW_FLOW_CAP && first < g_flow_seq - BW_FLOW_CAP + 1) first = g_flow_seq - BW_FLOW_CAP + 1;
+    for (uint64_t q = first; q <= g_flow_seq && n < BW_FLOW_CAP; q++) {
+        FlowEntry *e = &g_flow_ring[q % BW_FLOW_CAP];
+        if (e->seq == q) out[n++] = *e;
+    }
+    if (g_flow_seq > *last_seq) *last_seq = g_flow_seq;
+    LeaveCriticalSection(&g_flow_lock);
+    for (int i = 0; i < n; i++) cb(out[i].dir, out[i].label, out[i].bytes, ctx);
+    return n;
+}
+
+/* =========================================================================
  * DYNAMIC BUFFER (HEAP ALLOCATION WITH BOUNDS CHECKING)
  * ========================================================================= */
 typedef struct {
@@ -283,6 +564,17 @@ static void db_free(DynBuf *b) {
 /* =========================================================================
  * WINDOWS CNG (bcrypt.dll) SHA-256 HASHING
  * ========================================================================= */
+#ifdef AGENT_LEGACY_XP
+static bool compute_buffer_sha256(const unsigned char *data, size_t len, char *out_hex) {
+    capi_sha256_stream st;
+    unsigned char rgbHash[32];
+    if (!capi_stream_init(&st)) return false;
+    if (!capi_stream_update(&st, data, len)) { capi_stream_final(&st, rgbHash); return false; }
+    if (!capi_stream_final(&st, rgbHash)) return false;
+    legacy_hex32(rgbHash, out_hex);
+    return true;
+}
+#else
 static bool compute_buffer_sha256(const unsigned char *data, size_t len, char *out_hex) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
@@ -322,12 +614,22 @@ cleanup:
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
 }
+#endif /* AGENT_LEGACY_XP */
 
 /* =========================================================================
  * V4 SESSION CRYPTO: HMAC-SHA256 (CNG), session-key derivation, nonces.
  * The PSK itself never crosses the wire: mutual challenge-response at
  * handshake, then per-frame HMAC under a session key. No secret in logs.
  * ========================================================================= */
+#ifdef AGENT_LEGACY_XP
+static bool compute_hmac_sha256_hex(const unsigned char *key, size_t keylen,
+        const unsigned char *data, size_t len, char *out_hex) {
+    unsigned char rgbHash[32];
+    if (!capi_hmac_sha256_raw(key, keylen, data, len, rgbHash)) return false;
+    legacy_hex32(rgbHash, out_hex);
+    return true;
+}
+#else
 static bool compute_hmac_sha256_hex(const unsigned char *key, size_t keylen,
         const unsigned char *data, size_t len, char *out_hex) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
@@ -361,8 +663,23 @@ cleanup:
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
 }
+#endif /* AGENT_LEGACY_XP */
 
 /* sesskey = SHA256(psk || agent_nonce || master_nonce), raw 32 bytes. */
+#ifdef AGENT_LEGACY_XP
+static bool derive_sesskey(const char *psk, const char *agent_nonce, const char *master_nonce, unsigned char out[32]) {
+    capi_sha256_stream st;
+    if (!capi_stream_init(&st)) return false;
+    if (!capi_stream_update(&st, (const unsigned char *)psk, strlen(psk))
+        || !capi_stream_update(&st, (const unsigned char *)agent_nonce, strlen(agent_nonce))
+        || !capi_stream_update(&st, (const unsigned char *)master_nonce, strlen(master_nonce))) {
+        unsigned char tmp[32];
+        capi_stream_final(&st, tmp);
+        return false;
+    }
+    return capi_stream_final(&st, out);
+}
+#else
 static bool derive_sesskey(const char *psk, const char *agent_nonce, const char *master_nonce, unsigned char out[32]) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
@@ -386,7 +703,19 @@ cleanup:
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
 }
+#endif /* AGENT_LEGACY_XP */
 
+#ifdef AGENT_LEGACY_XP
+static bool gen_hex_nonce(char out33[33]) {
+    unsigned char r[16];
+    if (!capi_rng(r, sizeof(r))) return false;
+    for (int i = 0; i < 16; ++i) {
+        snprintf(out33 + (i * 2), 3, "%02x", r[i]);
+    }
+    out33[32] = '\0';
+    return true;
+}
+#else
 static bool gen_hex_nonce(char out33[33]) {
     unsigned char r[16];
     if (!NT_SUCCESS(BCryptGenRandom(NULL, r, sizeof(r), BCRYPT_USE_SYSTEM_PREFERRED_RNG))) return false;
@@ -396,7 +725,41 @@ static bool gen_hex_nonce(char out33[33]) {
     out33[32] = '\0';
     return true;
 }
+#endif /* AGENT_LEGACY_XP */
 
+#ifdef AGENT_LEGACY_XP
+static bool compute_file_sha256(const char *path, char *out_hex, uint64_t *out_size, DWORD *out_win32_err) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        if (out_win32_err) *out_win32_err = GetLastError();
+        return false;
+    }
+    LARGE_INTEGER fsize;
+    if (GetFileSizeEx(hFile, &fsize) && out_size) {
+        *out_size = (uint64_t)fsize.QuadPart;
+    }
+    capi_sha256_stream st;
+    BYTE chunk[65536];
+    unsigned char rgbHash[32];
+    bool ok = false;
+    DWORD bread = 0;
+    if (!capi_stream_init(&st)) { CloseHandle(hFile); return false; }
+    while (ReadFile(hFile, chunk, sizeof(chunk), &bread, NULL) && bread > 0) {
+        if (!capi_stream_update(&st, chunk, bread)) goto file_cleanup;
+    }
+    if (!capi_stream_final(&st, rgbHash)) { CloseHandle(hFile); return false; }
+    legacy_hex32(rgbHash, out_hex);
+    ok = true;
+    CloseHandle(hFile);
+    return ok;
+file_cleanup: {
+    unsigned char tmp[32];
+    capi_stream_final(&st, tmp);
+    CloseHandle(hFile);
+    return false;
+    }
+}
+#else
 static bool compute_file_sha256(const char *path, char *out_hex, uint64_t *out_size, DWORD *out_win32_err) {
     HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -446,6 +809,7 @@ cleanup:
     CloseHandle(hFile);
     return ok;
 }
+#endif /* AGENT_LEGACY_XP */
 
 /* =========================================================================
  * BASE64 & JSON HELPERS
@@ -1238,12 +1602,22 @@ static BOOL CALLBACK EnumKioskWindowsProc(HWND hwnd, LPARAM lParam) {
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == 0) return TRUE;
 
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    HANDLE hProc = OpenProcess(
+#ifdef AGENT_LEGACY_XP
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, /* XP: LIMITED_INFO does not exist */
+#else
+        PROCESS_QUERY_LIMITED_INFORMATION,
+#endif
+        FALSE, pid);
     if (!hProc) return TRUE;
 
     char exe_path[MAX_PATH];
+#ifdef AGENT_LEGACY_XP
+    if (legacy_proc_image(hProc, exe_path, sizeof(exe_path))) {
+#else
     DWORD sz = sizeof(exe_path);
     if (QueryFullProcessImageNameA(hProc, 0, exe_path, &sz)) {
+#endif
         char *fname = strrchr(exe_path, '\\');
         fname = fname ? (fname + 1) : exe_path;
         if (_stricmp(fname, data->target_name) == 0 ||
@@ -1390,18 +1764,146 @@ static void format_uptime_human(uint64_t sec, char *out, size_t sz) {
     else snprintf(out, sz, "%02um %02us", m, s);
 }
 
+static void console_setup_vt(void);
 static void console_ui_init(void) {
     InitializeCriticalSection(&g_console_lock);
     g_ui_start_tick = GetTickCount64();
+    console_setup_vt();
+}
 
+/* ---- ANSI bridge for consoles without VT support (XP, Vista, 7, 8, early 10) ----
+ * The agent's console output uses ANSI colour sequences. Old consoles print them raw
+ * ("[96m..."), so stdout/stderr are redirected into a pipe; a small thread strips the
+ * escape sequences, maps SGR colours to native console attributes and writes UTF-16. */
+static HANDLE g_ansi_con = NULL;
+static WORD g_ansi_base = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+
+static WORD ansi_rgb_attr(int r, int g, int b, int bg) {
+    int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    WORD a = 0;
+    if (r > mx / 2 && r > 40) a |= bg ? BACKGROUND_RED : FOREGROUND_RED;
+    if (g > mx / 2 && g > 40) a |= bg ? BACKGROUND_GREEN : FOREGROUND_GREEN;
+    if (b > mx / 2 && b > 40) a |= bg ? BACKGROUND_BLUE : FOREGROUND_BLUE;
+    if (mx > 170) a |= bg ? BACKGROUND_INTENSITY : FOREGROUND_INTENSITY;
+    return a;
+}
+static WORD ansi_apply_sgr(WORD attr, const char *seq) {
+    static const WORD c8[8] = { 0, FOREGROUND_RED, FOREGROUND_GREEN, FOREGROUND_RED | FOREGROUND_GREEN, FOREGROUND_BLUE,
+                                FOREGROUND_RED | FOREGROUND_BLUE, FOREGROUND_GREEN | FOREGROUND_BLUE,
+                                FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE };
+    int v[16], n = 0; const char *q = seq;
+    if (!*q) { v[n++] = 0; }
+    while (*q && n < 16) { v[n++] = atoi(q); while (*q && *q != ';') q++; if (*q == ';') q++; }
+    const WORD FG = 0x0F, BG = 0xF0;
+    for (int i = 0; i < n; i++) {
+        int c = v[i];
+        if (c == 0) attr = g_ansi_base;
+        else if (c == 1) attr |= FOREGROUND_INTENSITY;
+        else if (c == 2 || c == 22) attr &= (WORD)~FOREGROUND_INTENSITY;
+        else if (c >= 30 && c <= 37) attr = (WORD)((attr & BG) | c8[c - 30]);
+        else if (c >= 90 && c <= 97) attr = (WORD)((attr & BG) | c8[c - 90] | FOREGROUND_INTENSITY);
+        else if (c == 39) attr = (WORD)((attr & BG) | (g_ansi_base & FG));
+        else if (c >= 40 && c <= 47) attr = (WORD)((attr & FG) | (c8[c - 40] << 4));
+        else if (c >= 100 && c <= 107) attr = (WORD)((attr & FG) | (c8[c - 100] << 4) | BACKGROUND_INTENSITY);
+        else if (c == 49) attr = (WORD)((attr & FG) | (g_ansi_base & BG));
+        else if ((c == 38 || c == 48) && i + 1 < n) {
+            int bg = c == 48; WORD a = 0;
+            if (v[i + 1] == 5 && i + 2 < n) {                 /* 256-colour: grey ramp / cube / basic */
+                int k = v[i + 2], r, g, b;
+                if (k < 16) { a = (WORD)(c8[k & 7] | (k > 7 ? FOREGROUND_INTENSITY : 0)); if (bg) a = (WORD)(a << 4); }
+                else if (k >= 232) { r = g = b = 8 + (k - 232) * 10; a = ansi_rgb_attr(r, g, b, bg); }
+                else { k -= 16; r = (k / 36) * 51; g = ((k / 6) % 6) * 51; b = (k % 6) * 51; a = ansi_rgb_attr(r, g, b, bg); }
+                i += 2;
+            } else if (v[i + 1] == 2 && i + 4 < n) { a = ansi_rgb_attr(v[i + 2], v[i + 3], v[i + 4], bg); i += 4; }
+            attr = bg ? (WORD)((attr & FG) | a) : (WORD)((attr & BG) | a);
+        }
+    }
+    return attr;
+}
+static void ansi_emit(const char *t, int len, char *carry, int *carry_n) {
+    /* keep an incomplete trailing UTF-8 sequence for the next chunk */
+    int cut = len, k = len - 1, back = 0;
+    while (k >= 0 && back < 3 && ((unsigned char)t[k] & 0xC0) == 0x80) { k--; back++; }
+    if (k >= 0) {
+        unsigned char lead = (unsigned char)t[k]; int need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+        if (need > len - k) cut = k;
+    }
+    if (cut > 0) {
+        WCHAR w[4200]; DWORD wr = 0;
+        int nw = MultiByteToWideChar(CP_UTF8, 0, t, cut, w, 4200);
+        if (nw <= 0) nw = MultiByteToWideChar(CP_ACP, 0, t, cut, w, 4200);
+        if (nw > 0) WriteConsoleW(g_ansi_con, w, (DWORD)nw, &wr, NULL);
+    }
+    *carry_n = len - cut;
+    if (*carry_n > 0) memcpy(carry, t + cut, (size_t)*carry_n);
+}
+static DWORD WINAPI ansi_bridge_thread(LPVOID p) {
+    HANDLE rd = (HANDLE)p;
+    char in[4096], text[4100], seq[64], carry[4];
+    int state = 0, sl = 0, carry_n = 0;
+    WORD attr = g_ansi_base;
+    DWORD n;
+    while (ReadFile(rd, in, sizeof(in), &n, NULL) && n > 0) {
+        int tl = 0;
+        if (carry_n) { memcpy(text, carry, (size_t)carry_n); tl = carry_n; carry_n = 0; }
+        for (DWORD i = 0; i < n; i++) {
+            char c = in[i];
+            if (state == 0) {
+                if (c == 0x1B) { ansi_emit(text, tl, carry, &carry_n); tl = 0; if (carry_n) { memcpy(text, carry, (size_t)carry_n); tl = carry_n; carry_n = 0; } state = 1; }
+                else if (c != '\r') { text[tl++] = c; if (tl >= 4096) { ansi_emit(text, tl, carry, &carry_n); tl = 0; if (carry_n) { memcpy(text, carry, (size_t)carry_n); tl = carry_n; carry_n = 0; } } }
+            } else if (state == 1) {
+                if (c == '[') { state = 2; sl = 0; } else state = 0;      /* ESC 7 / ESC 8 etc.: dropped */
+            } else {
+                if (c >= 0x40 && c <= 0x7E) {
+                    seq[sl] = '\0';
+                    if (c == 'm') { attr = ansi_apply_sgr(attr, seq); SetConsoleTextAttribute(g_ansi_con, attr); }
+                    state = 0;                                         /* cursor/region sequences: dropped */
+                } else if (sl < 63) seq[sl++] = c;
+            }
+        }
+        ansi_emit(text, tl, carry, &carry_n);
+    }
+    return 0;
+}
+/* Real OS major version (RtlGetVersion does not lie like GetVersionEx without a manifest). */
+static DWORD os_major_version(void) {
+    typedef LONG (WINAPI *rtlgetver_t)(OSVERSIONINFOW *);
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    rtlgetver_t fn = nt ? (rtlgetver_t)(void *)GetProcAddress(nt, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW vi; ZeroMemory(&vi, sizeof(vi)); vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fn && fn(&vi) == 0) return vi.dwMajorVersion;
+    return 5;
+}
+static void console_install_ansi_bridge(void) {
+    static volatile LONG installed = 0;
+    if (InterlockedCompareExchange(&installed, 1, 0) != 0) return;
+    g_ansi_con = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (g_ansi_con == INVALID_HANDLE_VALUE) { g_ansi_con = NULL; InterlockedExchange(&installed, 0); return; }
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    if (GetConsoleScreenBufferInfo(g_ansi_con, &ci)) g_ansi_base = ci.wAttributes;
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, NULL, 1 << 16)) { CloseHandle(g_ansi_con); g_ansi_con = NULL; InterlockedExchange(&installed, 0); return; }
+    int fd = _open_osfhandle((intptr_t)wr, _O_BINARY | _O_WRONLY);
+    if (fd < 0) { CloseHandle(rd); CloseHandle(wr); CloseHandle(g_ansi_con); g_ansi_con = NULL; InterlockedExchange(&installed, 0); return; }
+    fflush(stdout); fflush(stderr);
+    _dup2(fd, _fileno(stdout));
+    _dup2(fd, _fileno(stderr));
+    HANDLE th = CreateThread(NULL, 64 * 1024, ansi_bridge_thread, rd, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (th) CloseHandle(th);
+}
+
+/* VT mode + log scroll region on whatever console is attached now (startup or on demand). */
+static void console_setup_vt(void) {
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut == INVALID_HANDLE_VALUE || hOut == NULL) return;
     if (GetFileType(hOut) != FILE_TYPE_CHAR) return;
 
     DWORD mode = 0;
     if (!GetConsoleMode(hOut, &mode)) return;
-    if (SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
-        g_vt_enabled = true;
+    if (os_major_version() >= 10 && SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        g_vt_enabled = true;                 /* VT sequences exist only since Windows 10 */
+    } else {
+        console_install_ansi_bridge();   /* XP/7/8: translate colours instead of printing raw escapes */
     }
     SetConsoleOutputCP(CP_UTF8);
 
@@ -1418,6 +1920,56 @@ static void console_ui_init(void) {
         printf("\033[3;1H");
         fflush(stdout);
     }
+}
+
+/* Status-window "Show console" button. The GUI build has no console; one is
+ * allocated on first use (recent log replayed into it) and then shown/hidden.
+ * Its close box is removed: closing a console window would kill the agent. */
+void bw_console_toggle(void) {
+    EnterCriticalSection(&g_console_lock);
+    HWND cw = GetConsoleWindow();
+    if (!cw) {
+        if (AllocConsole()) {
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+            freopen("CONIN$", "r", stdin);
+            /* inherited/redirected std handles survive AllocConsole: point them at the new console */
+            HANDLE co = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+            if (co != INVALID_HANDLE_VALUE) { SetStdHandle(STD_OUTPUT_HANDLE, co); SetStdHandle(STD_ERROR_HANDLE, co); }
+            cw = GetConsoleWindow();
+            if (cw) {
+                HMENU sm = GetSystemMenu(cw, FALSE);
+                if (sm) DeleteMenu(sm, SC_CLOSE, MF_BYCOMMAND);
+            }
+            SetConsoleTitleA("Bridge Agent - console (hide it from the status window)");
+            console_setup_vt();
+            /* replay what happened before the console existed */
+            EnterCriticalSection(&g_log_lock);
+            size_t n = g_log_count;
+            for (size_t i = 0; i < n; i++) {
+                LogEntry *e = &g_log_ring[(g_log_head + LOG_RING_CAPACITY - n + i) % LOG_RING_CAPACITY];
+                printf("[%-5s] [+%6llums] %s\n", log_level_str(e->level), (unsigned long long)e->uptime_ms, e->msg);
+            }
+            LeaveCriticalSection(&g_log_lock);
+            fflush(stdout);
+        }
+        if (cw) { ShowWindow(cw, SW_SHOW); SetForegroundWindow(cw); }
+    } else {
+        ShowWindow(cw, IsWindowVisible(cw) ? SW_HIDE : SW_SHOW);
+    }
+    LeaveCriticalSection(&g_console_lock);
+}
+
+bool bw_console_visible(void) {
+    HWND cw = GetConsoleWindow();
+    return cw && IsWindowVisible(cw);
+}
+
+/* Fatal start-up message: stderr when there is one, else a message box (GUI build, double-click). */
+static void startup_fatal(const char *msg) {
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) fprintf(stderr, "%s\n", msg);
+    else MessageBoxA(NULL, msg, "Bridge Agent", MB_OK | MB_ICONERROR);
 }
 
 static void console_ui_shutdown(void) {
@@ -3853,11 +4405,16 @@ typedef struct {
     DWORD start_tick;
     DWORD last_activity_tick;
 
-    /* CNG SHA-256 streaming state */
+    /* Streaming SHA-256 state: CNG normally, CryptoAPI on legacy (same digest) */
+#ifdef AGENT_LEGACY_XP
+    capi_sha256_stream capi;
+    bool capi_active;
+#else
     BCRYPT_ALG_HANDLE hAlg;
     BCRYPT_HASH_HANDLE hHash;
     PBYTE pbHashObj;
     DWORD cbHashObj;
+#endif
     char final_sha256[65];
     bool hash_finalized;
 
@@ -3868,6 +4425,13 @@ static BinaryTransferSession g_bin_session;
 static uint8_t g_bin_chunk_buf[BRIDGE_BIN_MAX_CHUNK_SIZE]; /* 64 KB in .bss */
 
 static void bin_session_abort_locked(void) {
+#ifdef AGENT_LEGACY_XP
+    if (g_bin_session.capi_active) {
+        unsigned char tmp[32];
+        capi_stream_final(&g_bin_session.capi, tmp);
+        g_bin_session.capi_active = false;
+    }
+#else
     if (g_bin_session.hHash) {
         BCryptDestroyHash(g_bin_session.hHash);
         g_bin_session.hHash = NULL;
@@ -3880,6 +4444,7 @@ static void bin_session_abort_locked(void) {
         BCryptCloseAlgorithmProvider(g_bin_session.hAlg, 0);
         g_bin_session.hAlg = NULL;
     }
+#endif
     if (g_bin_session.hFile != INVALID_HANDLE_VALUE && g_bin_session.hFile != NULL) {
         CloseHandle(g_bin_session.hFile);
         g_bin_session.hFile = INVALID_HANDLE_VALUE;
@@ -3907,6 +4472,7 @@ static bool send_bin_ack(SOCKET s, uint32_t file_id, uint32_t status, uint64_t o
     LeaveCriticalSection(&g_send_lock);
 
     if (ok) {
+        bw_flow_push(BW_FLOW_OUT, "chunk.ack", (uint64_t)(sizeof(tag) + sizeof(ack)));
         EnterCriticalSection(&g_telemetry_lock);
         g_bytes_tx += sizeof(tag) + sizeof(ack);
         g_packets_tx++;
@@ -3954,6 +4520,7 @@ static bool handle_bin_chunk(SOCKET s, const uint8_t *prefix) {
         }
     }
 
+    bw_flow_push(BW_FLOW_IN, "file.chunk", (uint64_t)hdr.length);
     EnterCriticalSection(&g_telemetry_lock);
     g_bytes_rx += sizeof(BridgeBinaryChunkHeader) + hdr.length;
     g_packets_rx++;
@@ -4006,10 +4573,16 @@ static bool handle_bin_chunk(SOCKET s, const uint8_t *prefix) {
         return true;
     }
 
-    /* 8. Stream CNG SHA-256 while data is hot in CPU cache */
+    /* 8. Stream SHA-256 while data is hot in CPU cache */
+#ifdef AGENT_LEGACY_XP
+    if (g_bin_session.capi_active && written > 0) {
+        capi_stream_update(&g_bin_session.capi, g_bin_chunk_buf, written);
+    }
+#else
     if (g_bin_session.hHash && written > 0) {
         BCryptHashData(g_bin_session.hHash, (PBYTE)g_bin_chunk_buf, (ULONG)written, 0);
     }
+#endif
 
     g_bin_session.total_written += written;
     g_bin_session.last_activity_tick = GetTickCount();
@@ -4021,6 +4594,15 @@ static bool handle_bin_chunk(SOCKET s, const uint8_t *prefix) {
     /* 9. Finalize if EOF flag set */
     if (hdr.flags & BIN_FLAG_EOF) {
         BYTE rgbHash[32];
+#ifdef AGENT_LEGACY_XP
+        if (g_bin_session.capi_active) {
+            if (capi_stream_final(&g_bin_session.capi, rgbHash)) {
+                legacy_hex32(rgbHash, g_bin_session.final_sha256);
+                g_bin_session.hash_finalized = true;
+            }
+            g_bin_session.capi_active = false;
+        }
+#else
         if (g_bin_session.hHash) {
             if (NT_SUCCESS(BCryptFinishHash(g_bin_session.hHash, rgbHash, sizeof(rgbHash), 0))) {
                 for (int i = 0; i < 32; ++i) {
@@ -4032,6 +4614,7 @@ static bool handle_bin_chunk(SOCKET s, const uint8_t *prefix) {
             BCryptDestroyHash(g_bin_session.hHash);
             g_bin_session.hHash = NULL;
         }
+#endif
 
         CloseHandle(g_bin_session.hFile);
         g_bin_session.hFile = INVALID_HANDLE_VALUE;
@@ -4074,6 +4657,17 @@ static void handle_fs_bin_open(const char *req, int64_t id, DynBuf *resp) {
         return;
     }
 
+    bool stream_ok = false;
+#ifdef AGENT_LEGACY_XP
+    capi_sha256_stream open_st;
+    if (capi_stream_init(&open_st)) {
+        g_bin_session.capi = open_st;
+        g_bin_session.capi_active = true;
+        stream_ok = true;
+    } else {
+        g_bin_session.capi_active = false;
+    }
+#else
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
     PBYTE pbHashObj = NULL;
@@ -4093,6 +4687,8 @@ static void handle_fs_bin_open(const char *req, int64_t id, DynBuf *resp) {
             }
         }
     }
+#endif
+    (void)stream_ok;
 
     g_bin_session.is_active = 1;
     g_bin_session.file_id = file_id;
@@ -4103,10 +4699,12 @@ static void handle_fs_bin_open(const char *req, int64_t id, DynBuf *resp) {
     g_bin_session.expected_size = (uint64_t)expected_size;
     g_bin_session.start_tick = GetTickCount();
     g_bin_session.last_activity_tick = GetTickCount();
+#ifndef AGENT_LEGACY_XP
     g_bin_session.hAlg = hAlg;
     g_bin_session.hHash = hHash;
     g_bin_session.pbHashObj = pbHashObj;
     g_bin_session.cbHashObj = cbHashObj;
+#endif
     g_bin_session.final_sha256[0] = '\0';
     g_bin_session.hash_finalized = false;
 
@@ -4132,6 +4730,16 @@ static void handle_fs_bin_close(const char *req, int64_t id, DynBuf *resp) {
         return;
     }
 
+#ifdef AGENT_LEGACY_XP
+    if (!g_bin_session.hash_finalized && g_bin_session.capi_active) {
+        BYTE rgbHash[32];
+        if (capi_stream_final(&g_bin_session.capi, rgbHash)) {
+            legacy_hex32(rgbHash, g_bin_session.final_sha256);
+            g_bin_session.hash_finalized = true;
+        }
+        g_bin_session.capi_active = false;
+    }
+#else
     if (!g_bin_session.hash_finalized && g_bin_session.hHash) {
         BYTE rgbHash[32];
         if (NT_SUCCESS(BCryptFinishHash(g_bin_session.hHash, rgbHash, sizeof(rgbHash), 0))) {
@@ -4146,6 +4754,7 @@ static void handle_fs_bin_close(const char *req, int64_t id, DynBuf *resp) {
     if (g_bin_session.hHash) { BCryptDestroyHash(g_bin_session.hHash); g_bin_session.hHash = NULL; }
     if (g_bin_session.pbHashObj) { free(g_bin_session.pbHashObj); g_bin_session.pbHashObj = NULL; }
     if (g_bin_session.hAlg) { BCryptCloseAlgorithmProvider(g_bin_session.hAlg, 0); g_bin_session.hAlg = NULL; }
+#endif
     if (g_bin_session.hFile != INVALID_HANDLE_VALUE && g_bin_session.hFile != NULL) {
         CloseHandle(g_bin_session.hFile);
         g_bin_session.hFile = INVALID_HANDLE_VALUE;
@@ -4291,10 +4900,12 @@ static void run_reverse_session(SOCKET s, bool *trigger_exit) {
              "{\"jsonrpc\":\"2.0\",\"method\":\"agent.hello\",\"params\":{\"version\":\"" BRIDGE_PROTOCOL_VERSION "\",\"arch\":\"" AGENT_ARCH "\",\"os\":\"windows\",\"pid\":%lu,\"agent_id\":\"%s\",\"agent_nonce\":\"%s\"}}",
              (unsigned long)GetCurrentProcessId(), g_agent_id, agent_nonce);
     if (!send_frame(s, hello)) return;
+    bw_flow_push(BW_FLOW_OUT, "agent.hello", strlen(hello));
 
     /* Expect auth.challenge {master_nonce} */
     char *ch = NULL;
     if (!recv_json_frame(s, &ch)) return;
+    bw_flow_push(BW_FLOW_IN, "auth.challenge", strlen(ch));
     char *ch_method = json_get_string(ch, "method");
     char *master_nonce = json_get_string(ch, "master_nonce");
     bool ch_ok = ch_method && strcmp(ch_method, "auth.challenge") == 0 && master_nonce && strlen(master_nonce) == 32;
@@ -4313,10 +4924,12 @@ static void run_reverse_session(SOCKET s, bool *trigger_exit) {
              "{\"jsonrpc\":\"2.0\",\"method\":\"auth.response\",\"params\":{\"agent_id\":\"%s\",\"hmac\":\"%s\"}}",
              g_agent_id, rh);
     if (!send_frame(s, aresp)) { free(master_nonce); return; }
+    bw_flow_push(BW_FLOW_OUT, "auth.response", strlen(aresp));
 
     /* Expect auth.confirm; verify the MASTER (mutual auth) */
     char *cf = NULL;
     if (!recv_json_frame(s, &cf)) { free(master_nonce); return; }
+    bw_flow_push(BW_FLOW_IN, "auth.confirm", strlen(cf));
     char *cf_method = json_get_string(cf, "method");
     char *peer_h = json_get_string(cf, "hmac");
     char rab2[32 + 32 + 64 + 1];
@@ -4404,6 +5017,7 @@ static void run_reverse_session(SOCKET s, bool *trigger_exit) {
         char *method = json_get_string(req, "method");
         int64_t id = json_get_int64(req, "id", 0);
         const char *short_method = method ? method : "UNKNOWN";
+        bw_flow_push(BW_FLOW_IN, short_method, (uint64_t)frame_bytes);
 
         if (strcmp(short_method, "sys.ping") != 0 && strcmp(short_method, "exec.run") != 0) {
             char summary[64] = "";
@@ -4437,6 +5051,7 @@ static void run_reverse_session(SOCKET s, bool *trigger_exit) {
                     if (env) {
                         snprintf(env, env_cap, "{\"v\":4,\"body_b64\":\"%s\",\"mac\":\"%s\"}", b64out, mhex);
                         ok = send_frame(s, env);
+                        if (ok) bw_flow_push(BW_FLOW_OUT, short_method, (uint64_t)resp.len);
                         free(env);
                     }
                 }
@@ -4651,6 +5266,10 @@ static void provision_load(void) {
  * by relaunching once through the runas verb. Returns 1 to continue here,
  * 0 when the elevated twin takes over, -1 when elevation failed/declined. */
 static int ensure_elevated(int argc, char *argv[]) {
+#ifdef AGENT_LEGACY_XP
+    /* XP has no TokenElevation: Administrators-membership check instead. */
+    if (legacy_is_admin()) return 1;
+#else
     BOOL elevated = FALSE;
     HANDLE tok = NULL;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
@@ -4659,6 +5278,7 @@ static int ensure_elevated(int argc, char *argv[]) {
         CloseHandle(tok);
     }
     if (elevated) return 1;
+#endif
     char cmd[4096]; size_t o = 0;
     for (int i = 1; i < argc && o < sizeof(cmd) - 4; i++) {
         if (strchr(argv[i], '"')) continue; /* never pass a quote through the relaunch */
@@ -4687,7 +5307,7 @@ int main(int argc, char *argv[]) {
     int el = ensure_elevated(argc, argv);
     if (el == 0) return 0; /* elevated twin takes over */
     if (el < 0) {
-        fprintf(stderr, "agent.exe: administrator rights required (UAC declined or failed). Refusing to run degraded.\n");
+        startup_fatal("agent.exe: administrator rights required (UAC declined or failed). Refusing to run degraded.");
         return 2;
     }
     provision_load(); /* zero-config sidecar first; CLI/env override below */
@@ -4695,6 +5315,9 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--selftest") == 0) {
             /* Side-by-side pre-flight test */
+            { HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+              if ((!so || so == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS)) {
+                  freopen("CONOUT$", "w", stdout); freopen("CONOUT$", "w", stderr); } }
             WSADATA wsa;
             if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 101;
             char test_hex[65] = "";
@@ -4740,14 +5363,14 @@ int main(int argc, char *argv[]) {
         if (n == 0 || n >= sizeof(g_psk_token)) g_psk_token[0] = '\0';
     }
     if (!g_psk_token[0]) {
-        fprintf(stderr, "agent.exe: PSK required (--token <psk>, BRIDGE_PSK env or agent.provision sidecar). Refusing to run unauthenticated.\n");
+        startup_fatal("agent.exe: PSK required (--token <psk>, BRIDGE_PSK env or agent.provision sidecar). Refusing to run unauthenticated.");
         return 2;
     }
     if (!g_agent_id[0]) {
         default_agent_id(g_agent_id);
     }
     if (!valid_agent_id(g_agent_id)) {
-        fprintf(stderr, "agent.exe: bad --agent-id (1-32 chars: A-Za-z0-9_-, starts alnum).\n");
+        startup_fatal("agent.exe: bad --agent-id (1-32 chars: A-Za-z0-9_-, starts alnum).");
         return 2;
     }
 
@@ -4755,22 +5378,38 @@ int main(int argc, char *argv[]) {
 
     // Console: headless keeps the classic visible console; GUI mode only reuses
     // an existing console and never allocates one (the window is the UI).
+    // GUI-subsystem build: no console unless headless. Redirected std handles
+    // (tests, services) are kept; otherwise reuse the launching terminal or allocate one.
     if (g_headless && GetConsoleWindow() == NULL) {
-        AllocConsole();
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONOUT$", "w", stderr);
-        freopen("CONIN$", "r", stdin);
+        HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (!so || so == INVALID_HANDLE_VALUE) {
+            if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+            freopen("CONIN$", "r", stdin);
+        }
     }
     HWND hConsoleWnd = GetConsoleWindow();
     if (hConsoleWnd) {
-        ShowWindow(hConsoleWnd, SW_SHOW);
-        SetForegroundWindow(hConsoleWnd);
+        DWORD procs[4];
+        bool private_console = GetConsoleProcessList(procs, 4) <= 1;
+        if (g_headless) {
+            ShowWindow(hConsoleWnd, SW_SHOW);
+            SetForegroundWindow(hConsoleWnd);
+        } else if (private_console) {
+            /* console-subsystem build double-clicked: the window is the UI, keep the console hidden */
+            HMENU sm = GetSystemMenu(hConsoleWnd, FALSE);
+            if (sm) DeleteMenu(sm, SC_CLOSE, MF_BYCOMMAND);
+            ShowWindow(hConsoleWnd, SW_HIDE);
+        }
     }
     console_ui_init();
     SetConsoleTitleA("Bridge Agent [INITIALIZING]");
 
     /* Initialize synchronization primitives strictly before any thread or log */
     InitializeCriticalSection(&g_log_lock);
+    InitializeCriticalSection(&g_flow_lock);
+    InterlockedExchange(&g_flow_ready, 1);
     InitializeCriticalSection(&g_telemetry_lock);
     InitializeCriticalSection(&g_send_lock);
     init_telemetry_ring();
@@ -4787,6 +5426,7 @@ int main(int argc, char *argv[]) {
             agent_log(LOG_LVL_INFO, "Status window started (use --headless to disable).");
         } else {
             g_headless = true;
+            if (GetConsoleWindow()) ShowWindow(GetConsoleWindow(), SW_SHOW);
             agent_log(LOG_LVL_WARN, "No desktop available; running headless.");
         }
     }
