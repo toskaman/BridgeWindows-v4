@@ -158,6 +158,13 @@ class RemoteAgentBridge:
     def start_server(self):
         if not self.token:
             raise RuntimeError('PSK required: pass token=... (CLI --token or OPENBRIDGE_PSK env). Refusing to listen unauthenticated.')
+        if len(self.token) < 20:
+            # Warn-only (not refuse): the live deployment's PSK length is unknown here and refusing
+            # could break it. A short PSK falls to offline brute force from one captured handshake.
+            sys.stderr.write('[BridgeServer] WARNING: PSK is short (<20 chars). Use a long random PSK '
+                             '(e.g. python -c "import secrets; print(secrets.token_urlsafe(32))") on the bridge '
+                             'and every agent.\n')
+            sys.stderr.flush()
         t = threading.Thread(target=self._server_loop, daemon=True)
         t.start()
 
@@ -167,6 +174,7 @@ class RemoteAgentBridge:
         self.server_sock.bind((self.host, self.port))
         self.server_sock.listen(16)
         sys.stderr.write(f"[BridgeServer] v{PROTOCOL_VERSION} listening for agents on {self.host}:{self.port} (max {self.max_agents})...\n")
+        sys.stderr.write("[BridgeServer] WARNING: v4 frames are authenticated (mutual HMAC), NOT encrypted. Keep this link on a trusted LAN: a passive observer sees RPC payloads (screenshots, files, commands).\n")
         sys.stderr.flush()
 
         while self.running:
