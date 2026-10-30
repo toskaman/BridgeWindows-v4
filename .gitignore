@@ -3,3 +3,14 @@ __pycache__/
 *.old
 _to_delete/
 *.log
+# Build outputs (local only; reproduce via documented toolchains on E:)
+agents/esp32-ob/idf/build/
+agents/esp32-ob/ob_esp32/build/
+agents/playdate-ob/game/build-arm/
+agents/playdate-ob/game/build-sim/
+agents/playdate-ob/game/build-sim64/
+agents/playdate-ob/game/openbridge.pdx/
+agents/playdate-ob/game/openbridge_DEVICE.pdx/
+agents/playdate-ob/game/Source/pdex.dll
+agents/playdate-ob/game/Source/pdex.elf
+agents/playdate-ob/game/.sentry-native/
