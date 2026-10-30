@@ -1,7 +1,7 @@
 /*
  * BridgeLinux - Linux Remote Agent v4.0.0 (x86_64 + aarch64)
  * Single static ELF, POSIX + embedded SHA-256 (no OpenSSL needed).
- * Speaks protocol v4: mutual HMAC auth + session-MAC envelopes (no v3 compat).
+ * Speaks protocol v4: mutual HMAC auth + session-MAC envelopes (v4 only).
  *
  * Build (from Windows, zig toolchain):
  *   zig cc -target x86_64-linux-musl -O2 -s agent_linux.c -o agent-linux-x64 -lpthread -lm
