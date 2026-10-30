@@ -1,6 +1,6 @@
 # BridgeWindows v4.0.0 (multi-PC)
 
-Remote operation bridge: the **master PC** administers **up to 8 Windows PCs simultaneously** over the LAN through authenticated reverse-TCP agents. Breaking protocol change from v3 (no v3 compatibility).
+Remote operation bridge: the **master PC** administers **up to 8 Windows PCs simultaneously** over the LAN through authenticated reverse-TCP agents (protocol v4: mutual auth + session MACs).
 
 ## Topology
 
@@ -78,7 +78,7 @@ See `agent_gui.png`.
 
 `remote_update_agent` with no `agent_binary_path` auto-picks from `agents/` by the
 target's reported OS/arch (explicit path still wins; ambiguous multi-agent calls
-are rejected). Stale default path (`e:\PROJECT PET RIFT\...`) removed.
+are rejected).
 
 ## Master
 
@@ -95,7 +95,7 @@ python bridge_mcp.py --host 0.0.0.0 --port 9876 --max-agents 8
 - `python -u test_bridge.py` → **23/23 (100%)** with 2 real `agent.exe`: RPC, telemetry, logs, exec cmd/powershell, file R/W/patch/delete, SHA-256 chunk transfers up+down, recursive sync, process list/priority, screenshot, **2-PC routing (Test 17)**, **hot self-update + reconnect (Test 18)**.
 - OpenBridge `WindowsBridge` speaks v4 too (single-agent + read-only allowlist): `tests/runtime/test_windows_bridge.py` 7/7, full OpenBridge suite 376/376, real agent.exe interop verified.
 
-Note: the e2e spawns agents with pipes to DEVNULL — the agent `printf`-logs every RPC and an undrained pipe wedges it mid-suite (pre-existing harness flaw, fixed in test).
+Note: the e2e spawns agents with pipes to DEVNULL — the agent `printf`-logs every RPC and an undrained pipe wedges it mid-suite (harness flaw, fixed in test).
 
 ## Known limits (honest)
 

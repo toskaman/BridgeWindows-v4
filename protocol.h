@@ -4,14 +4,14 @@
 #include <stdint.h>
 
 /*
- * BridgeWindows Protocol Definition v3.0.0
+ * BridgeWindows Protocol Definition v4.0.0
  * Master (Antigravity PC) <---> Agent (Remote Windows 10 x86 PC)
  *
  * Framing:
  * [4 bytes Big-Endian Length] + [UTF-8 JSON-RPC 2.0 Payload]
  */
 
-#define BRIDGE_PROTOCOL_VERSION "4.0.0"  /* v4: mutual auth + session-MAC envelopes + agent registry (no v3 compat) */
+#define BRIDGE_PROTOCOL_VERSION "4.0.0"  /* v4: mutual auth + session-MAC envelopes + agent registry (v4 only) */
 #define DEFAULT_BRIDGE_PORT     9876
 #define MAX_FRAME_SIZE          (32 * 1024 * 1024)  /* 32 MB hard cap per frame */
 #define MAX_PIPE_BUFFER_BYTES   (256 * 1024)        /* 256 KB max stdout / stderr */
@@ -24,7 +24,7 @@
 #define LOG_MSG_MAX_LEN         236
 
 /*
- * SWARM-180 / SWARM-189: BINARY CHUNKED TRANSFER PROTOCOL v3.7.0
+ * SWARM-180 / SWARM-189: BINARY CHUNKED TRANSFER PROTOCOL v4.0.0
  * Zero-allocation, high-throughput binary framing over multiplexed TCP
  */
 #define BRIDGE_BIN_MAGIC            0xBF        /* Multiplexing discriminator byte */

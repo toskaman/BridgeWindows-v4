@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BridgeWindows CLI Client v3.1.0
+BridgeWindows CLI Client v4.0.0
 Fast command-line tool to query BridgeWindows Daemon on 127.0.0.1:9877.
 Supports base64 transport, script execution, registry queries, and telemetry.
 """
@@ -226,7 +226,7 @@ def main():
         print(res.get("result", res.get("error", "")))
 
     elif cmd in ("update-agent", "upgrade"):
-        bin_path = sys.argv[2] if len(sys.argv) > 2 else os.path.abspath("e:\\PROJECT PET RIFT\\BridgeWindows\\agent.exe")
+        bin_path = sys.argv[2] if len(sys.argv) > 2 else os.path.abspath("agent.exe")
         res = post_tool("remote_update_agent", {"agent_binary_path": bin_path})
         print(res.get("result", res.get("error", "")))
 

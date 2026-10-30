@@ -68,9 +68,9 @@ class FakeAgent:
 
     def connect(self):
         self.sock = socket.create_connection(('127.0.0.1', self.port), timeout=5)
-        if self.proto == 'v3':
+        if self.proto == 'legacy':
             send_frame(self.sock, {'jsonrpc': '2.0', 'method': 'agent.hello',
-                                   'params': {'version': '3.7.1', 'arch': 'x64', 'pid': 1, 'token': PSK}})
+                                   'params': {'version': '0.0.0', 'arch': 'x64', 'pid': 1, 'token': PSK}})
             return
         send_frame(self.sock, {'jsonrpc': '2.0', 'method': 'agent.hello',
                                'params': {'version': '4.0.0', 'arch': 'x64', 'pid': 1,
@@ -247,11 +247,11 @@ class MultiAgentTests(unittest.TestCase):
         self.assertTrue(len(blob) > 100)
         self.assertNotIn(PSK.encode(), blob)
 
-    def test_stale_v3_hello_rejected(self):
-        v3 = FakeAgent('OLD', MultiAgentTests._port, proto='v3')
-        v3.connect()  # sends legacy hello; server must close without registering
+    def test_stale_legacy_hello_rejected(self):
+        old = FakeAgent('OLD', MultiAgentTests._port, proto='legacy')
+        old.connect()  # sends legacy hello; server must close without registering
         time.sleep(0.5)
-        v3.close()
+        old.close()
         self.assertNotIn('OLD', self.bridge.agents)
 
     def test_server_refuses_to_listen_without_psk(self):

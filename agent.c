@@ -1,5 +1,5 @@
 /*
- * BridgeWindows - Win32 x86 Remote Agent v3.4.0
+ * BridgeWindows - Win32 x86 Remote Agent v4.0.0
  * Target: Windows 10 32-bit (x86) & 64-bit
  * Footprint: < 3.5 MB RAM, Single Portable .exe, Native Win32 + CNG (bcrypt.dll)
  */

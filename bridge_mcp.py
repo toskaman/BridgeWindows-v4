@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BridgeWindows MCP Server for Antigravity v3.0.0
+BridgeWindows MCP Server v4.0.0
 Provides seamless, native remote control of a secondary Windows 10 x86 PC
 via reverse TCP connection with hot auto-update, telemetry, structured logs,
 and bidirectional recursive file synchronization.
