@@ -22,6 +22,7 @@ import secrets
 import threading
 import time
 import argparse
+import collections
 from contextvars import ContextVar
 from typing import Dict, Any, Optional, List
 
@@ -112,6 +113,7 @@ class _AgentSession:
         self.connected_at = time.time()
         self.last_seen = self.connected_at
         self.alive = True
+        self.notifications = collections.deque(maxlen=64)   # agent-initiated, MAC-verified; drained by drain_notifications
 
 
 class RemoteAgentBridge:
@@ -329,7 +331,12 @@ class RemoteAgentBridge:
                 if req_id in session.pending_requests:
                     session.pending_responses[req_id] = data
                     session.pending_requests[req_id].set()
-                # Unknown agent notifications are ignored (extensible, fail-closed).
+                elif isinstance(data.get('method'), str) and len(data['method']) <= 64:
+                    params = data.get('params')
+                    if isinstance(params, dict) and len(json.dumps(params)) <= 4096:
+                        session.notifications.append({'ts': time.time(), 'method': data['method'], 'params': params})
+                        sys.stderr.write(f"[BridgeServer] Agent '{agent_id}' notification: {data['method']}\n")
+                        sys.stderr.flush()
         except (ConnectionError, ValueError, OSError, KeyError):
             pass
         except Exception as e:
@@ -342,6 +349,16 @@ class RemoteAgentBridge:
                 sock.close()
             except OSError:
                 pass
+
+    def drain_notifications(self, agent_id: str):
+        """Return and clear queued agent-initiated notifications (MAC-verified at receipt)."""
+        with self.lock:
+            session = self.agents.get(agent_id)
+            if session is None:
+                return []
+            out = list(session.notifications)
+            session.notifications.clear()
+            return out
 
     def _takeover_stale(self, agent_id: str) -> bool:
         """Steal a ghost slot: same agent_id, silent for TAKEOVER_AFTER_S.
