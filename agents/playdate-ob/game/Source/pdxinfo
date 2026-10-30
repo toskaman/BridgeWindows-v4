@@ -1,0 +1,6 @@
+name=OpenBridge
+author=MSDOS
+description=OpenBridge agent: this Playdate joins your OpenBridge device fabric.
+bundleID=fr.openbridge.playdate
+version=0.1.0
+buildNumber=1

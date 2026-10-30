@@ -139,6 +139,28 @@ class PlaydateProtoTests(unittest.TestCase):
         finally:
             self._stop(b)
 
+    def test_ob_poll_single_step_path(self):
+        # The Playdate update() loop drives ob_poll() frame by frame; --poll
+        # exercises that same path on host (POLL_OK marker per served RPC).
+        b = self._bridge()
+        try:
+            p = self._run_agent("PD-POLL", "--poll", "2")
+            try:
+                self._wait_agent(b, "PD-POLL")
+                pong = b.send_rpc("sys.ping", {}, agent_id="PD-POLL",
+                                  timeout=10)
+                self.assertTrue(pong.get("result", {}).get("pong"), pong)
+                diag = b.send_rpc("sys.diag", {}, agent_id="PD-POLL",
+                                  timeout=10)
+                self.assertIn("hostname", diag.get("result", {}), diag)
+                out, _ = p.communicate(timeout=20)
+                self.assertIn("POLL_OK 2", out)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+        finally:
+            self._stop(b)
+
     def test_button_notification_reaches_bridge(self):
         b = self._bridge()
         try:

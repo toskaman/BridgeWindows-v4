@@ -1,0 +1,7 @@
+# OpenBridge Playdate agent config. Edit before packaging for real use:
+# host = this PC's LAN address (127.0.0.1 works in the simulator only),
+# port = the bridge agent port, psk = your pre-shared key.
+host=127.0.0.1
+port=19991
+psk=TestPSK-Only-For-Loopback-99
+agent_id=PD-SIM

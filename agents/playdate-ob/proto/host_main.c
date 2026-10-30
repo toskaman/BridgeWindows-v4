@@ -42,7 +42,7 @@ static int tcp_recv(void *ctx, void *buf, size_t len) {
         fd_set rf; struct timeval tv; int n;
         FD_ZERO(&rf); FD_SET(s, &rf);
         tv.tv_sec = 15; tv.tv_usec = 0; /* idle 15s (ESP32 parity) -> serve exits */
-        if (select((int)(s + 1), &rf, 0, 0, &tv) <= 0) return -1;
+        { int _s = select((int)(s + 1), &rf, 0, 0, &tv); if (_s == 0) return -2; if (_s < 0) return -1; }
         n = recv(s, (char*)buf + o, (int)(len - o), 0);
         if (n <= 0) return -1;
         o += (size_t)n;
@@ -152,6 +152,20 @@ int main(int argc, char **argv) {
           memcpy(method, nt, (size_t)(comma - nt)); method[comma - nt] = 0;
           if (ob_notify(&a, method, comma + 1)) return 1;
           printf("NOTIFY_OK %s\n", method); fflush(stdout);
+      } }
+    { const char *pl = flag(argc, argv, "--poll");
+      if (pl && atoi(pl) > 0) { /* frame-stepped path (what the Playdate update loop drives) */
+          int want = atoi(pl), served = 0;
+          for (;;) {
+              int r = ob_poll(&a);
+              if (r < 0) return 1;
+              if (r == 0) continue; /* idle tick: no data yet */
+              served++;
+              printf("POLL_OK %d\n", served); fflush(stdout);
+              if (served >= want) break;
+          }
+          printf("SERVED %lu rpc\n", a.rpc_count);
+          return 0;
       } }
     if (ob_serve(&a, once)) return 1;
     printf("SERVED %lu rpc\n", a.rpc_count);
