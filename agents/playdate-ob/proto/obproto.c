@@ -74,10 +74,10 @@ static int send_frame(ob_agent *a, const char *json, size_t len) {
 static int recv_frame(ob_agent *a, char *buf, size_t cap, size_t *outlen) {
     unsigned char hdr[4];
     size_t len;
-    if (a->recv_all(a->io_ctx, hdr, 4)) return -1;
+    { int _r = a->recv_all(a->io_ctx, hdr, 4); if (_r == -2) return -2; if (_r) return -1; }
     len = ((size_t)hdr[0]<<24)|((size_t)hdr[1]<<16)|((size_t)hdr[2]<<8)|hdr[3];
     if (len == 0 || len >= cap || len > OB_FRAME_MAX) return -1;
-    if (a->recv_all(a->io_ctx, buf, len)) return -1;
+    { int _r = a->recv_all(a->io_ctx, buf, len); if (_r == -2) return -2; if (_r) return -1; }
     buf[len] = 0;
     *outlen = len;
     return 0;
@@ -112,8 +112,11 @@ int ob_handshake(ob_agent *a, const char *agent_nonce_hex) {
             "{\"jsonrpc\":\"2.0\",\"method\":\"agent.hello\",\"params\":"
             "{\"version\":\"4.0.0\",\"arch\":\"%s\",\"pid\":1,\"agent_id\":\"%s\",\"agent_nonce\":\"%s\"}}",
             a->arch, a->agent_id, agent_nonce_hex) >= (int)sizeof(hello)) return -1;
+    a->hs_stage = 1;
     if (send_frame(a, hello, strlen(hello))) return -1;
-    if (recv_frame(a, frame, sizeof(frame), &flen)) return -1;
+    a->hs_stage = 2;
+    { int _r = recv_frame(a, frame, sizeof(frame), &flen); if (_r) { a->hs_err = _r; return -1; } }
+    a->hs_stage = 3;
     root = oj_parse(&pool, frame, flen);
     if (root < 0) return -1;
     { int m = oj_get(&pool, root, "method");
@@ -127,8 +130,11 @@ int ob_handshake(ob_agent *a, const char *agent_nonce_hex) {
     if (snprintf(resp, sizeof(resp),
             "{\"jsonrpc\":\"2.0\",\"method\":\"auth.response\",\"params\":"
             "{\"agent_id\":\"%s\",\"hmac\":\"%s\"}}", a->agent_id, expect) >= (int)sizeof(resp)) return -1;
+    a->hs_stage = 4;
     if (send_frame(a, resp, strlen(resp))) return -1;
-    if (recv_frame(a, frame, sizeof(frame), &flen)) return -1;
+    a->hs_stage = 5;
+    { int _r = recv_frame(a, frame, sizeof(frame), &flen); if (_r) { a->hs_err = _r; return -1; } }
+    a->hs_stage = 6;
     root = oj_parse(&pool, frame, flen);
     if (root < 0) return -1;
     { int m = oj_get(&pool, root, "method");
@@ -146,6 +152,7 @@ int ob_handshake(ob_agent *a, const char *agent_nonce_hex) {
       ob_sha256_once(cat, strlen(cat), a->sesskey);
     }
     a->authed = 1;
+    a->hs_stage = 7;
     return 0;
 }
 
@@ -171,7 +178,7 @@ static int recv_wrapped(ob_agent *a, char *inner, size_t cap, size_t *outlen) {
     size_t flen, blen, ilen;
     oj_pool pool;
     int root, vb, mb, bb;
-    if (recv_frame(a, frame, sizeof(frame), &flen)) return -1;
+    { int _r = recv_frame(a, frame, sizeof(frame), &flen); if (_r == -2) return -2; if (_r) return -1; }
     root = oj_parse(&pool, frame, flen);
     if (root < 0) return -1;
     vb = oj_get(&pool, root, "v");
@@ -279,19 +286,27 @@ static int dispatch(ob_agent *a, oj_pool *pool, int root) {
     return reply_error(a, id, has_id, -32601, "method not found");
 }
 
-int ob_serve(ob_agent *a, int max_rpc) {
+int ob_poll(ob_agent *a) {
     static char inner[OB_FRAME_MAX];
     size_t ilen;
-    int served = 0;
     oj_pool pool;
+    int root, r;
+    r = recv_wrapped(a, inner, sizeof(inner), &ilen);
+    if (r == -2) return 0; /* idle: no data before the io timeout */
+    if (r) return -1;
+    root = oj_parse(&pool, inner, ilen);
+    if (root < 0) return -1;
+    if (dispatch(a, &pool, root)) return -1;
+    return 1;
+}
+
+int ob_serve(ob_agent *a, int max_rpc) {
+    int served = 0;
     for (;;) {
-        int root;
+        int r;
         if (max_rpc > 0 && served >= max_rpc) return 0;
-        if (recv_wrapped(a, inner, sizeof(inner), &ilen))
-            return (served > 0 || a->notif_count > 0) ? 0 : -1; /* idle/EOF after progress = clean exit */
-        root = oj_parse(&pool, inner, ilen);
-        if (root < 0) return -1;
-        if (dispatch(a, &pool, root)) return -1;
+        r = ob_poll(a);
+        if (r <= 0) return (served > 0 || a->notif_count > 0) ? 0 : -1;
         served++;
     }
 }
